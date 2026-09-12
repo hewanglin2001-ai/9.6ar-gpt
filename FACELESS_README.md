@@ -2,7 +2,8 @@
 
 ## 打开与测试
 
-1. Unity 停止播放；GitHub Desktop 选中 9.6ar-gpt 的 main，Fetch origin 后 Pull origin。
+1. Unity 停止播放；GitHub Desktop 选中 9.6ar-gpt，点击 Fetch origin，
+   再在 Current Branch 中选择 codex/skin-reconstruction-v2 测试分支。
 2. 回到 Unity 6000.0.58f2，等待导入。若提示场景变更，选择 Reload。
 3. 打开 Assets/MediaPipeUnity/Samples/Scenes/Face Landmark Detection/Face Landmark Detection.unity。
 4. 点击播放（Play），允许摄像头。MidFaceEffect 已连接两个 Shader，无需手动拖拽。
