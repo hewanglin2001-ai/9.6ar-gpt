@@ -70,9 +70,9 @@ Shader "Faceless/SkinComposite"
                         [unroll] for (int n=0;n<7;n++)
                         {
                             float d=RegionDistance(p,n);
-                            float line=1.0-smoothstep(0.4,1.6,min(abs(d),abs(d-_RegionAxes[n].z)));
+                            float regionOutline=1.0-smoothstep(0.4,1.6,min(abs(d),abs(d-_RegionAxes[n].z)));
                             float dotCenter=1.0-smoothstep(1.2,2.5,length(p-_Regions[n].xy));
-                            outputColor.rgb=lerp(outputColor.rgb,float3(1,0.8,0.15),max(line,dotCenter));
+                            outputColor.rgb=lerp(outputColor.rgb,float3(1,0.8,0.15),max(regionOutline,dotCenter));
                         }
                         float bound=1.0-smoothstep(0.4,1.6,abs(BoundaryDistance(p)));
                         outputColor.rgb=lerp(outputColor.rgb,float3(0.1,0.65,1),bound);
