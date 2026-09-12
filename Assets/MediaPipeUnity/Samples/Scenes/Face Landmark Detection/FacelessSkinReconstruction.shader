@@ -7,10 +7,10 @@ Shader "Hidden/Faceless/SkinReconstruction"
         CGINCLUDE
         #include "UnityCG.cginc"
         #include "FacelessSkinCommon.cginc"
-        sampler2D _MainTex, _KnownTex, _DonorTex, _HistoryTex;
+        sampler2D _MainTex, _KnownTex, _DonorTex, _HistoryTex, _GuideTex;
         float4 _MainTex_TexelSize;
         float2 _Direction;
-        float _TemporalWeight;
+        float _TemporalWeight, _LocalColorStrength;
 
         float4 Gaussian(float2 uv)
         {
@@ -24,48 +24,98 @@ Shader "Hidden/Faceless/SkinReconstruction"
                   tex2D(_MainTex, uv - d * 3.2307692308)) * 0.0702702703;
             return c;
         }
+        float4 SkinDonorTap(float2 pixelPosition, float gaussianWeight)
+        {
+            float2 cameraUV = pixelPosition * _CameraSize.zw;
+            float weight = TrustedSkinWeight(pixelPosition) * gaussianWeight;
+            if (any(cameraUV < 0.0) || any(cameraUV > 1.0)) weight = 0.0;
+            return float4(tex2D(_MainTex, cameraUV).rgb * weight, weight);
+        }
         float4 fragDonors(v2f_img i) : SV_Target
         {
             int n = min((int)(i.uv.x * 6), 5);
-            float2 c = _Donors[n].xy * _CameraSize.zw;
-            float2 r = _Donors[n].z * _CameraSize.zw;
-            float3 col = tex2D(_MainTex, c).rgb * 4.0;
-            col += (tex2D(_MainTex,c+float2(r.x,0)).rgb + tex2D(_MainTex,c-float2(r.x,0)).rgb
-                + tex2D(_MainTex,c+float2(0,r.y)).rgb + tex2D(_MainTex,c-float2(0,r.y)).rgb) * 2.0;
-            col += tex2D(_MainTex,c+r).rgb + tex2D(_MainTex,c-r).rgb
-                + tex2D(_MainTex,c+float2(r.x,-r.y)).rgb + tex2D(_MainTex,c+float2(-r.x,r.y)).rgb;
-            return float4(col / 16.0, 1);
+            float2 donorPixel = _Donors[n].xy;
+            float radius = _Donors[n].z;
+            float4 moments = SkinDonorTap(donorPixel, 4.0);
+            moments += SkinDonorTap(donorPixel+float2(radius,0),2.0) + SkinDonorTap(donorPixel-float2(radius,0),2.0)
+                + SkinDonorTap(donorPixel+float2(0,radius),2.0) + SkinDonorTap(donorPixel-float2(0,radius),2.0);
+            moments += SkinDonorTap(donorPixel+float2(radius,radius),1.0) + SkinDonorTap(donorPixel-float2(radius,radius),1.0)
+                + SkinDonorTap(donorPixel+float2(radius,-radius),1.0) + SkinDonorTap(donorPixel+float2(-radius,radius),1.0);
+            return float4(moments.rgb / max(moments.a, 0.00001), moments.a / 16.0);
+        }
+        float4 fragGuide(v2f_img i) : SV_Target
+        {
+            // A locally weighted color plane follows the left/right AND
+            // upper/lower cheek illumination. It is a low-frequency trend,
+            // not a single averaged color used to paint the entire face.
+            float2 p = AtlasToPixel(i.uv);
+            float total = 0.0;
+            float2 sumDelta = float2(0,0);
+            float3 sumColor = float3(0,0,0), sumXX = float3(0,0,0);
+            float3 sumXColor = float3(0,0,0), sumYColor = float3(0,0,0);
+            float3 minimumColor = float3(1,1,1), maximumColor = float3(0,0,0);
+            [unroll] for (int n = 0; n < 6; n++)
+            {
+                float4 donor = tex2D(_DonorTex, float2((n+0.5)/6.0,0.5));
+                float2 delta = (_Donors[n].xy - p) / max(_FrameOrigin.zw, float2(1,1));
+                float donorConfidence = smoothstep(0.02, 0.35, donor.a);
+                float weight = donorConfidence / pow(0.06 + dot(delta,delta), 1.5);
+                total += weight; sumDelta += delta * weight; sumColor += donor.rgb * weight;
+                sumXX += float3(delta.x*delta.x, delta.x*delta.y, delta.y*delta.y) * weight;
+                sumXColor += donor.rgb * (delta.x * weight); sumYColor += donor.rgb * (delta.y * weight);
+                if (donorConfidence > 0.0) { minimumColor = min(minimumColor,donor.rgb); maximumColor = max(maximumColor,donor.rgb); }
+            }
+            if (total < 0.0001) return float4(0,0,0,0);
+            float2 meanDelta = sumDelta / total;
+            float3 meanColor = sumColor / total;
+            float3 covariance = sumXX / total - float3(meanDelta.x*meanDelta.x, meanDelta.x*meanDelta.y, meanDelta.y*meanDelta.y);
+            // Ridge stabilizes near-profile donors whose projections coincide.
+            covariance.x += 0.0001; covariance.z += 0.0001;
+            float determinant = max(covariance.x*covariance.z-covariance.y*covariance.y,0.00000001);
+            float3 covXColor = sumXColor/total - meanDelta.x*meanColor;
+            float3 covYColor = sumYColor/total - meanDelta.y*meanColor;
+            float3 slopeX = (covXColor*covariance.z-covYColor*covariance.y)/determinant;
+            float3 slopeY = (covYColor*covariance.x-covXColor*covariance.y)/determinant;
+            float3 guide = meanColor - slopeX*meanDelta.x - slopeY*meanDelta.y;
+            float3 allowance = (maximumColor-minimumColor)*0.25 + 0.025;
+            guide = clamp(guide, minimumColor-allowance, maximumColor+allowance);
+            return float4(guide * _LocalColorStrength, 1);
         }
         float4 fragSeeds(v2f_img i) : SV_Target
         {
             float2 p = AtlasToPixel(i.uv);
             float2 uv = p * _CameraSize.zw;
             if (any(uv < 0.0) || any(uv > 1.0)) return 0;
-            float confidence = BoundaryGuard(p);
-            [unroll] for (int n = 0; n < 7; n++)
-            {
-                // Feature pixels have ZERO source weight before any filtering.
-                // Expanded source exclusion also removes eye-socket/lip shadows.
-                float edge = max(_RegionAxes[n].z, 1.0);
-                confidence *= smoothstep(0.0, edge * 0.45, RegionDistance(p, n));
-            }
-            float y = dot(p - _FrameOrigin.xy, normalize(_FrameV.xy));
-            confidence *= 1.0 - smoothstep(_FrameV.z, _FrameV.z + _FrameOrigin.w * 0.025, y);
+            float confidence = TrustedSkinWeight(p);
             float3 source = tex2D(_MainTex, uv).rgb;
-            float3 cheek = 0;
-            [unroll] for (int n = 0; n < 6; n++) cheek += tex2D(_DonorTex, float2((n+0.5)/6.0,0.5)).rgb / 6.0;
+            float4 illumination = tex2D(_GuideTex, i.uv);
+            float3 cheek = float3(0,0,0);
+            float cheekWeight = 0.0;
+            [unroll] for (int n = 0; n < 6; n++)
+            {
+                float4 donor = tex2D(_DonorTex, float2((n+0.5)/6.0,0.5));
+                cheek += donor.rgb * donor.a; cheekWeight += donor.a;
+            }
             // Luminance-relative rejection, no fixed skin-tone threshold.
             // Cheek color is a validity reference, never an opaque color overlay.
-            float ratio = FacelessSkinLuma(source) / max(FacelessSkinLuma(cheek), 0.005);
-            confidence *= smoothstep(0.24, 0.52, ratio) * (1.0 - smoothstep(2.5, 4.0, ratio));
-            return float4(source * confidence, confidence);
+            if (cheekWeight > 0.0001)
+            {
+                float3 localReference = lerp(cheek/cheekWeight,
+                    illumination.rgb / max(_LocalColorStrength, 0.01),
+                    _LocalColorStrength * illumination.a * 0.7);
+                float ratio = FacelessSkinLuma(source) / max(FacelessSkinLuma(localReference), 0.005);
+                confidence *= smoothstep(0.24, 0.52, ratio) * (1.0 - smoothstep(2.5, 4.0, ratio));
+            }
+            // Reconstruct the deviation from local illumination; adding the
+            // guide back later preserves gradients across wide missing regions.
+            float3 residual = source - illumination.rgb;
+            return float4(residual * confidence, confidence);
         }
         float4 fragGaussian(v2f_img i) : SV_Target { return Gaussian(i.uv); }
         float4 fragNormalize(v2f_img i) : SV_Target
         {
             float4 moments = tex2D(_MainTex, i.uv);
-            float3 fallback = 0;
-            [unroll] for (int n = 0; n < 6; n++) fallback += tex2D(_DonorTex,float2((n+0.5)/6.0,0.5)).rgb / 6.0;
+            float3 fallback = float3(0,0,0);
             return float4(moments.a > 0.00001 ? moments.rgb / moments.a : fallback, 1);
         }
         float4 fragPull(v2f_img i) : SV_Target
@@ -91,6 +141,10 @@ Shader "Hidden/Faceless/SkinReconstruction"
             // accelerate convergence rather than leaving a gray trail.
             float t = lerp(_TemporalWeight, 1.0, smoothstep(0.035, 0.16, change));
             return float4(lerp(previous, current, t), 1);
+        }
+        float4 fragRestoreColor(v2f_img i) : SV_Target
+        {
+            return float4(tex2D(_MainTex,i.uv).rgb + tex2D(_GuideTex,i.uv).rgb, 1);
         }
         ENDCG
         Pass // 0: compact cheek samples
@@ -147,6 +201,22 @@ Shader "Hidden/Faceless/SkinReconstruction"
             #pragma target 3.5
             #pragma vertex vert_img
             #pragma fragment fragTemporal
+            ENDCG
+        }
+        Pass // 7: spatially varying illumination from valid cheek patches
+        {
+            CGPROGRAM
+            #pragma target 3.5
+            #pragma vertex vert_img
+            #pragma fragment fragGuide
+            ENDCG
+        }
+        Pass // 8: restore local illumination after residual reconstruction
+        {
+            CGPROGRAM
+            #pragma target 3.5
+            #pragma vertex vert_img
+            #pragma fragment fragRestoreColor
             ENDCG
         }
     }

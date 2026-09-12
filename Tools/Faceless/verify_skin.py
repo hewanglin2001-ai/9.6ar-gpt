@@ -34,8 +34,8 @@ def translate(s):
     s = s.replace('(int)(i.uv.x * 6)', 'int(i.uv.x * 6)')
     s = re.sub(r'(vec[234]\s+\w+\s*=)\s*0;',r'\1 vec3(0);',s)
     s = s.replace('return 0;', 'return vec4(0);')
-    s = s.replace('any(uv < 0.0)', 'any(lessThan(uv,vec2(0)))')
-    s = s.replace('any(uv > 1.0)', 'any(greaterThan(uv,vec2(1)))')
+    s = re.sub(r'any\((uv|cameraUV) < 0\.0\)', r'any(lessThan(\1,vec2(0)))', s)
+    s = re.sub(r'any\((uv|cameraUV) > 1\.0\)', r'any(greaterThan(\1,vec2(1)))', s)
     s = s.replace('all(atlas >= 0)', 'all(greaterThanEqual(atlas,vec2(0)))')
     s = s.replace('all(atlas <= 1)', 'all(lessThanEqual(atlas,vec2(1)))')
     return s
@@ -72,7 +72,10 @@ def fit_regions(points):
     center=(frame_min+frame_max)*.5
     origin=right*center[0]+up*center[1]
     u=right*width*1.25;v=up*max(height,frame_max[1]-frame_min[1])*1.16
-    axes=[p[133]-p[33],p[263]-p[362],right,p[327]-p[98],p[291]-p[61],p[291]-p[61],right]
+    def perp(v): return np.array([v[1],-v[0]])
+    axes=[p[133]-p[33],p[263]-p[362],right,p[327]-p[98],p[291]-p[61],p[291]-p[61],right,
+          perp(p[57]-p[203]),perp(p[287]-p[423]),perp(p[211]-p[61]),perp(p[431]-p[291])]
+    assert len(ids)==len(axes)==int(re.search(r'const int Count = (\d+)',source)[1])
     centers=[]; aa=[]
     for i,(group,x) in enumerate(zip(ids,axes)):
         x=x/np.linalg.norm(x) if x@x>.01 else u/np.linalg.norm(u)
@@ -88,11 +91,13 @@ def fit_regions(points):
         centers.append([*center,*r])
         edge=min(width*.09,max(width*.013,r[0]*.75))
         aa.append([*x,edge,0])
-    donors=np.array([[*p[i],width*.016,0] for i in [50,117,187,280,346,411]])
+    donor_ids=list(map(int,re.findall(r'\d+',source.split('DonorIndices =')[1].split('};')[0])))
+    donors=np.array([[*p[i],width*.016,0] for i in donor_ids])
     b=np.c_[p[boundary],np.zeros((36,2))]
     values={'_Regions':np.array(centers),'_RegionAxes':np.array(aa),'_Boundary':b,
             '_Donors':donors,'_FrameOrigin':[*origin,width,height],'_FrameU':[*u,0,0],
-            '_FrameV':[*v,max((p[105]-origin)@up,(p[334]-origin)@up)+height*.035,0],
+            '_FrameV':[*v,min((p[10]-origin)@up-height*.05,
+                             max((p[105]-origin)@up,(p[334]-origin)@up)+height*.12),0],
             '_ContourInset':width*.018,
             '_FaceBounds':[*p[:468].min(0),*p[:468].max(0)]}
     return values,ids
@@ -175,7 +180,7 @@ def synthetic_projection_tests(ctx,work,surface,tex,render,read):
     video=tex((size,size),color)
     black=tex((size,size),np.dstack((np.zeros((size,size,3)),np.ones((size,size)))))
     cases=[]; recovered=[];worst_alpha=1.;max_outside_error=0.;max_black_error=0.
-    important=np.array([1,2,0,13,14,17,61,291,159,386,105,334])
+    important=np.array([1,2,0,13,14,17,61,291,159,386,105,334,206,426,202,422])
     for perspective in [False,True]:
       for yaw in [-85,-70,-45,0,45,70,85]:
        for pitch in [-25,0,25]:
@@ -196,7 +201,7 @@ def synthetic_projection_tests(ctx,work,surface,tex,render,read):
           points=projected*np.array([-1 if mirrored else 1,1])+np.array([size*.48,size*.53])
           values,groups=fit_regions(points)
           values.update(_CameraSize=[size,size,1/size,1/size],_Amount=1.,_Volume=0.,_Grain=0.,
-                        _ShowMask=0.,_Stages=np.ones(7),_VideoVisibility=1.)
+                        _ShowMask=0.,_Stages=np.ones(len(groups)),_VideoVisibility=1.)
           features=np.unique(np.concatenate(groups))
           delta=points-values['_FrameOrigin'][:2]
           u=np.array(values['_FrameU'][:2]);v=np.array(values['_FrameV'][:2])
@@ -244,6 +249,103 @@ def synthetic_projection_tests(ctx,work,surface,tex,render,read):
     return {key:value for key,value in report.items() if key not in ['cases','previous_oval_guard_regressions_recovered']}|{
         'previous_oval_guard_recovery_cases':len(recovered)}
 
+def color_gradient_tests(work,surface,tex,render,read,reconstruct,seed_texture,donor_texture):
+    """Known continuous RGB fields, damaged only at excluded feature pixels.
+
+    Execute the actual reconstruction/composite fragments twice: illumination
+    guide disabled (the original normalized-pyramid baseline) and enabled.
+    The independent oracle is the undamaged analytic field, not a reimplementation
+    of the fill algorithm. This does not establish photographic realism.
+    """
+    canonical=np.array([[float(x) for x in row.split()[1:]]
+                       for row in (work/'canonical_face_model.obj').read_text().splitlines()
+                       if row.startswith('v ')])
+    canonical-=canonical.mean(0)
+    size=384
+    points=canonical[:,:2]*15+np.array([size*.48,size*.53])
+    values,groups=fit_regions(points)
+    values.update(_CameraSize=[size,size,1/size,1/size],_Amount=1.,_Volume=0.,_Grain=0.,
+                  _ShowMask=0.,_Stages=np.ones(len(groups)),_VideoVisibility=1.,_LocalColorStrength=1.)
+    surface_texture=tex((size,size));surface.render(points,surface_texture)
+    output=tex((size,size));white=tex((4,4),np.ones((4,4,4)))
+    black=tex((size,size),np.dstack((np.zeros((size,size,3)),np.ones((size,size)))))
+    render('frag',black,output,{'_SkinTex':white,'_SurfaceTex':surface_texture},values)
+    alpha=read(output)[:,:,0]
+    yy,xx=np.mgrid[:size,:size];pixels=np.stack((xx+.5,yy+.5),axis=-1)
+    origin=np.array(values['_FrameOrigin'][:2]);width,height=values['_FrameOrigin'][2:]
+    x=(pixels[:,:,0]-origin[0])/width;y=(pixels[:,:,1]-origin[1])/height
+    base=np.array([.58,.405,.305]);horizontal=np.array([.22,.12,.07]);vertical=np.array([.12,.105,.075])
+    affine=base+x[:,:,None]*horizontal+y[:,:,None]*vertical
+    broad_shadow=np.exp(-(((x+.18)/.42)**2+((y-.05)/.58)**2))*.085
+    curved=affine-broad_shadow[:,:,None]*np.array([1.,.85,.7])
+    core=alpha>.995;edge=(alpha>.1)&(alpha<.9)
+    assert core.sum()>1000 and edge.sum()>1000
+    features=np.unique(np.concatenate(groups))
+    strokes=np.zeros((size,size),dtype=bool)
+    for point in points[features]:
+        strokes|=((pixels-point)**2).sum(-1)<(width*.012)**2
+    # Damage lies wholly inside the excluded feature core; the clean surroundings
+    # carry the exact continuous lighting that should extend into the hole.
+    strokes&=alpha>.9999
+    feature_ids=[159,386,1,13,14,105,334,206,426,202,422]
+    report={}
+    def save(name,rgb):
+        Image.fromarray((np.clip(rgb[::-1],0,1)*255).astype('uint8')).save(work/name)
+    for fixture,clean in [('affine',affine),('curved_shadow',curved)]:
+        dirty=clean.copy();dirty[strokes]*=.14
+        source=tex((size,size),np.dstack((dirty,np.ones((size,size)))))
+        outcomes={};images={}
+        for name,strength in [('baseline',0.),('local_color',1.)]:
+            case=dict(values,_LocalColorStrength=strength)
+            skin=reconstruct(source,case)
+            render('frag',source,output,{'_SkinTex':skin,'_SurfaceTex':surface_texture},case)
+            actual=read(output)[:,:,:3];assert np.isfinite(actual).all()
+            error=actual-clean
+            core_rmse=float(np.sqrt(np.mean(error[core]**2)))
+            edge_rmse=float(np.sqrt(np.mean(error[edge]**2)))
+            quadrants=[]
+            for left,lower in [(True,False),(False,False),(True,True),(False,True)]:
+                area=core&((x<0) if left else (x>=0))&((y<0) if lower else (y>=0))
+                assert area.sum()>100
+                quadrants.append({'clean_rgb':clean[area].mean(0).tolist(),
+                                  'output_rgb':actual[area].mean(0).tolist()})
+            clean_means=np.array([q['clean_rgb'] for q in quadrants])
+            output_means=np.array([q['output_rgb'] for q in quadrants])
+            local_rmse=float(np.sqrt(np.mean((clean_means-output_means)**2)))
+            relative_spatial_variation=float(np.linalg.norm(output_means-output_means.mean(0))/
+                                             np.linalg.norm(clean_means-clean_means.mean(0)))
+            # Compare the error's pixel-to-pixel change around the feather: this
+            # isolates a spurious seam from the legitimate clean illumination.
+            gradient_error=np.stack((np.gradient(error,axis=0),np.gradient(error,axis=1)),axis=-1)
+            seam_gradient_rmse=float(np.sqrt(np.mean(gradient_error[edge]**2)))
+            seed=read(seed_texture)
+            u=np.array(values['_FrameU'][:2]);v=np.array(values['_FrameV'][:2])
+            delta=points[feature_ids]-origin
+            atlas=np.stack((delta@u/(u@u),delta@v/(v@v)),axis=-1)+.5
+            source_weights=pixel_sample(seed[:,:,3],atlas*seed_texture.width)
+            assert np.max(source_weights)<1e-6,(fixture,name,source_weights)
+            outcomes[name]={'core_rmse':core_rmse,'feather_rmse':edge_rmse,
+                            'feather_gradient_rmse':seam_gradient_rmse,'quadrant_mean_rmse':local_rmse,
+                            'relative_quadrant_variation':relative_spatial_variation,'quadrants':quadrants,
+                            'feature_source_weight_max':float(np.max(source_weights)),
+                            'donor_confidences':read(donor_texture)[0,:,3].tolist()}
+            images[name]=actual
+            save('color-'+fixture+'-'+name+'.png',actual)
+        save('color-'+fixture+'-clean.png',clean);save('color-'+fixture+'-input.png',dirty)
+        save('color-'+fixture+'-comparison.png',np.concatenate((dirty,images['baseline'],images['local_color'],clean),axis=1))
+        report[fixture]=outcomes
+    (work/'color-gradient-checks.json').write_text(json.dumps(report,indent=2))
+    print('color checks:',json.dumps(report))
+    # These are improvement gates, not claims of exact inpainting. Preserve the
+    # measured numbers on disk before asserting so a failed trial is reviewable.
+    for fixture,outcomes in report.items():
+        baseline=outcomes['baseline'];actual=outcomes['local_color']
+        for metric in ['core_rmse','feather_rmse','quadrant_mean_rmse','feather_gradient_rmse']:
+            assert actual[metric]<baseline[metric],(fixture,metric,actual[metric],baseline[metric])
+        assert actual['relative_quadrant_variation']>.5,(fixture,'color collapsed',actual)
+    assert report['affine']['local_color']['core_rmse']<.012,report['affine']
+    return report
+
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--work',type=Path,required=True);ap.add_argument('--egl');a=ap.parse_args()
     kwargs={'backend':'egl'}
@@ -265,11 +367,12 @@ def main():
     points=np.array(json.loads((a.work/'astronaut-landmarks.json').read_text()))[:,:2]
     points[:,0]*=w;points[:,1]=(1-points[:,1])*h
     vals,groups=fit_regions(points)
-    vals.update(_CameraSize=[w,h,1/w,1/h],_Amount=1.,_Volume=.045,_Grain=0.,_ShowMask=0.,
-                _Color=[1,1,1,1],_Stages=np.ones(7),_VideoVisibility=1.)
+    vals.update(_CameraSize=[w,h,1/w,1/h],_Amount=1.,_Volume=0.,_Grain=0.,_ShowMask=0.,
+                _Color=[1,1,1,1],_Stages=np.ones(len(groups)),_VideoVisibility=1.,_LocalColorStrength=1.)
     buffer=ctx.buffer(np.array([-1,-1,1,-1,-1,1,1,1],dtype='f4').tobytes())
     programs={}
-    for name in ['fragDonors','fragSeeds','fragGaussian','fragNormalize','fragPull','fragRelax','fragTemporal','frag']:
+    for name in ['fragDonors','fragGuide','fragSeeds','fragGaussian','fragNormalize','fragPull',
+                 'fragRelax','fragTemporal','fragRestoreColor','frag']:
         composite=name=='frag'
         body=shader_body(composite)
         setup='v2f i; i.uv=uv; i.color=vec4(1); i.local=vec4(0);' if composite else 'v2f_img i; i.uv=uv;'
@@ -300,20 +403,26 @@ def main():
         if '_MainTex_TexelSize' in prog:prog['_MainTex_TexelSize'].value=(1/src.width,1/src.height,src.width,src.height)
         fb=ctx.framebuffer(color_attachments=[target]);fb.use();ctx.viewport=(0,0,target.width,target.height)
         vao.render(moderngl.TRIANGLE_STRIP);fb.release()
-    donors=tex((6,1));render('fragDonors',original,donors)
+    donors=tex((6,1));guide=tex((256,256));restored=tex((256,256))
     sizes=[256,128,64,32,16,8,4]
     known=[tex((s,s)) for s in sizes];temp=[tex((s,s)) for s in sizes];filled=[tex((s,s)) for s in sizes]
-    render('fragSeeds',original,known[0],{'_DonorTex':donors})
-    for i in range(len(sizes)-1):
-        render('fragGaussian',known[i],temp[i],values={'_Direction':[1,0]})
-        render('fragGaussian',temp[i],known[i+1],values={'_Direction':[0,1]})
-    render('fragNormalize',known[-1],filled[-1],{'_DonorTex':donors})
-    for i in range(len(sizes)-2,-1,-1):
-        render('fragPull',filled[i+1],filled[i],{'_KnownTex':known[i]})
-        for _ in range(2):
-            render('fragRelax',filled[i],temp[i],{'_KnownTex':known[i]}, {'_Direction':[1,0]})
-            render('fragRelax',temp[i],filled[i],{'_KnownTex':known[i]}, {'_Direction':[0,1]})
-    bindings={'_SkinTex':filled[0],'_SurfaceTex':surface_texture}
+    def reconstruct(source,values):
+        render('fragDonors',source,donors,values=values)
+        render('fragGuide',source,guide,{'_DonorTex':donors},values)
+        render('fragSeeds',source,known[0],{'_DonorTex':donors,'_GuideTex':guide},values)
+        for i in range(len(sizes)-1):
+            render('fragGaussian',known[i],temp[i],values=dict(values,_Direction=[1,0]))
+            render('fragGaussian',temp[i],known[i+1],values=dict(values,_Direction=[0,1]))
+        render('fragNormalize',known[-1],filled[-1],{'_DonorTex':donors},values)
+        for i in range(len(sizes)-2,-1,-1):
+            render('fragPull',filled[i+1],filled[i],{'_KnownTex':known[i]},values)
+            for _ in range(2):
+                render('fragRelax',filled[i],temp[i],{'_KnownTex':known[i]},dict(values,_Direction=[1,0]))
+                render('fragRelax',temp[i],filled[i],{'_KnownTex':known[i]},dict(values,_Direction=[0,1]))
+        render('fragRestoreColor',filled[0],restored,{'_GuideTex':guide},values)
+        return restored
+    skin=reconstruct(original,vals)
+    bindings={'_SkinTex':skin,'_SurfaceTex':surface_texture}
     output=tex((w,h));render('frag',original,output,bindings)
     def read(t):return np.frombuffer(t.read(),dtype='f4').reshape(t.height,t.width,4).copy()
     result=read(output);assert np.isfinite(result).all()
@@ -321,7 +430,7 @@ def main():
     origin=np.array(vals['_FrameOrigin'][:2])
     u=np.array(vals['_FrameU'][:2]);v=np.array(vals['_FrameV'][:2])
     excluded=[]
-    for landmark in [159,386,1,13,14,105,334]:
+    for landmark in [159,386,1,13,14,105,334,206,426,202,422]:
         delta=points[landmark]-origin
         atlas=np.array([delta@u/(u@u),delta@v/(v@v)])+.5
         x,y=np.clip((atlas*256).astype(int),0,255)
@@ -341,11 +450,12 @@ def main():
     outside_error=float(np.max(np.abs(result[:,:,:3][outside]-image[outside])))
     assert outside_error<1e-5,outside_error
     profiles=synthetic_projection_tests(ctx,a.work,surface,tex,render,read)
+    color_report=color_gradient_tests(a.work,surface,tex,render,read,reconstruct,known[0],donors)
     stats={'fragment_programs':len(programs),'surface_vertex_and_fragment_compiled':True,
            'hlsl_reserved_name_lint':checked,'passthrough_max_error':err,'outside_max_error':outside_error,
            'zero_source_confidence_landmarks':excluded,
            'finite_output':True,'unity_editor_tested':False,'metal_tested':False,
-           'synthetic_profiles':profiles}
+           'synthetic_profiles':profiles,'synthetic_color':color_report}
     (a.work/'checks.json').write_text(json.dumps(stats,indent=2));print(stats)
 
 if __name__=='__main__':main()

@@ -6,7 +6,7 @@ using UnityEngine.UI;
 
 /// <summary>
 /// Camera-space skin reconstruction. Only trusted skin contributes to the fill;
-/// seven analytic feature masks composite it once over the original video.
+/// local analytic feature/fold masks composite it once over the original video.
 /// No face-shaped mesh, large-radius raw-video taps, CPU camera readback or
 /// per-frame Texture2D allocations.
 /// </summary>
@@ -25,7 +25,9 @@ public class MidFaceEraseMask : MonoBehaviour
     [Range(0f, 1f)] public float effectAmount = 1f;
     [Range(0.95f, 1.15f)] public float maskScale = 1f;
     [Range(0.025f, 0.10f)] public float featherFraction = 0.09f;
-    [Range(0f, 0.12f)] public float volume = 0.045f;
+    [Range(0f, 0.12f)] public float volume = 0f;
+    [Tooltip("Preserve spatial cheek lighting before reconstructing missing skin. Zero disables this illumination trend for comparison.")]
+    [Range(0f, 1f)] public float localColorStrength = 1f;
     [Range(0f, 1f)] public float fineGrain = 0.35f;
     [Tooltip("Only the smooth skin field is downsampled. Original video and mask edges stay at native resolution.")]
     public int reconstructionResolution = 256;
@@ -57,14 +59,14 @@ public class MidFaceEraseMask : MonoBehaviour
     readonly Vector2[] _lastRaw = new Vector2[468];
     readonly Vector2[] _velocity = new Vector2[468];
     readonly Transform[] _landmarkTransforms = new Transform[468];
-    readonly float[] _stages = new float[7];
+    readonly float[] _stages = new float[FacelessRegions.Count];
     FaceLandmarkerResultAnnotationController _controller;
     FaceLandmarkerRunner _runner;
     Renderer[] _annotationRenderers;
     bool[] _originalVisibility;
     Material _reconstruction, _composite, _originalMaterial;
     RenderTexture[] _known, _temp, _filled, _history;
-    RenderTexture _donorTexture;
+    RenderTexture _donorTexture, _guideTexture;
     int _historyIndex, _version = -1, _size, _cameraWidth, _cameraHeight;
     bool _historyReady, _pointsReady, _boundImage, _maskReady;
     float _nextFind, _lastLandmarkTime, _lastSeen = -100f;
@@ -325,7 +327,7 @@ public class MidFaceEraseMask : MonoBehaviour
 
     void UpdateStages()
     {
-        if (!playEntryAnimation) { for (int i = 0; i < 7; i++) _stages[i] = 1f; GrowthProgress = 0; return; }
+        if (!playEntryAnimation) { for (int i = 0; i < _stages.Length; i++) _stages[i] = 1f; GrowthProgress = 0; return; }
         float t = PresentationSeconds;
         _stages[0] = _stages[1] = Ramp(t, 3, 6);
         _stages[2] = Ramp(t, 5, 8);
@@ -333,6 +335,8 @@ public class MidFaceEraseMask : MonoBehaviour
         _stages[4] = Ramp(t, 8, 11);
         _stages[5] = Ramp(t, 9, 12);
         _stages[6] = Ramp(t, 12, 15);
+        _stages[7] = _stages[8] = Ramp(t, 6, 9); // nose-side folds
+        _stages[9] = _stages[10] = Ramp(t, 9, 12); // below mouth corners
         if (IsTracking) GrowthProgress = Ramp(t, 15, 24);
     }
     static float Ramp(float t, float a, float b) => Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(a, b, t));
@@ -361,6 +365,7 @@ public class MidFaceEraseMask : MonoBehaviour
         }
         _history = new[] {NewTexture(size,size,format,"Skin history A"),NewTexture(size,size,format,"Skin history B")};
         _donorTexture = NewTexture(6,1,format,"Cheek samples");
+        _guideTexture = NewTexture(size,size,format,"Local skin illumination");
         _historyReady = false;
         return true;
     }
@@ -377,6 +382,7 @@ public class MidFaceEraseMask : MonoBehaviour
     void RenderSkin(Texture source, float dt)
     {
         _regions.SetMaterial(_reconstruction);
+        _reconstruction.SetFloat("_LocalColorStrength", localColorStrength);
         _reconstruction.SetVector("_CameraSize", new Vector4(_cameraWidth,_cameraHeight,1f/_cameraWidth,1f/_cameraHeight));
         RenderTexture previous = RenderTexture.active;
         bool srgb = GL.sRGBWrite;
@@ -385,6 +391,8 @@ public class MidFaceEraseMask : MonoBehaviour
             GL.sRGBWrite = false; // RGBAHalf moments are numerical linear buffers.
             Graphics.Blit(source,_donorTexture,_reconstruction,0);
             _reconstruction.SetTexture("_DonorTex",_donorTexture);
+            Graphics.Blit(source,_guideTexture,_reconstruction,7);
+            _reconstruction.SetTexture("_GuideTex",_guideTexture);
             Graphics.Blit(source,_known[0],_reconstruction,1);
             for (int i=0;i<_known.Length-1;i++)
             {
@@ -408,12 +416,15 @@ public class MidFaceEraseMask : MonoBehaviour
                 }
             }
             int next=1-_historyIndex;
-            if (!_historyReady) Graphics.Blit(_filled[0],_history[next]);
+            // Buffers above hold signed color residuals. Add the spatial
+            // illumination back before temporal smoothing / final composition.
+            Graphics.Blit(_filled[0],_temp[0],_reconstruction,8);
+            if (!_historyReady) Graphics.Blit(_temp[0],_history[next]);
             else
             {
                 _reconstruction.SetTexture("_HistoryTex",_history[_historyIndex]);
                 _reconstruction.SetFloat("_TemporalWeight",1f-Mathf.Exp(-dt/Mathf.Max(colorSmoothingSeconds,0.001f)));
-                Graphics.Blit(_filled[0],_history[next],_reconstruction,6);
+                Graphics.Blit(_temp[0],_history[next],_reconstruction,6);
             }
             _historyIndex=next; _historyReady=true;
         }
@@ -495,7 +506,8 @@ public class MidFaceEraseMask : MonoBehaviour
         if (_filled!=null) foreach(var t in _filled) Release(t);
         if (_history!=null) foreach(var t in _history) Release(t);
         Release(_donorTexture);
-        _known=_temp=_filled=_history=null; _donorTexture=null; _historyReady=false;
+        Release(_guideTexture);
+        _known=_temp=_filled=_history=null; _donorTexture=_guideTexture=null; _historyReady=false;
     }
     void OnDisable()
     {

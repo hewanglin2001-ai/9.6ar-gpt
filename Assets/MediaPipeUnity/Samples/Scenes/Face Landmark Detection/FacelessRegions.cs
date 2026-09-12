@@ -1,13 +1,15 @@
 using UnityEngine;
 
 /// <summary>
-/// Seven feature regions in camera-texture pixels. The face contour is ONLY a
+/// Eleven feature regions in camera-texture pixels. The face contour is ONLY a
 /// safety boundary: it never supplies the positive coverage of the effect.
 /// </summary>
 public sealed class FacelessRegions
 {
-    public const int Count = 7;
-    static readonly int[] DonorIndices = {50,117,187,280,346,411};
+    public const int Count = 11;
+    // Upper, middle and lower cheek on each side. The old 117/346 patches
+    // overlapped the eye-region core, so they could not provide clean skin.
+    static readonly int[] DonorIndices = {123,187,192,352,411,416};
     public static readonly int[] BoundaryIndices =
     {
         10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,
@@ -25,7 +27,15 @@ public sealed class FacelessRegions
         new[] {61,146,91,181,84,17,314,405,321,375,291,185,40,39,37,0,267,
             269,270,409,78,95,88,178,87,14,317,402,318,324,308,191,80,81,82,
             13,312,311,310,415},
-        new[] {18,200,199,175}
+        new[] {18,200,199,175},
+        // Nasolabial folds: nose wing through the cheek-side crease to lip corner.
+        // These include the dark crease itself, so reconstruction cannot copy it.
+        new[] {98,203,206,216,165,92,186,57,61},
+        new[] {327,423,426,436,391,322,410,287,291},
+        // Marionette folds: lip corner down the central lower cheek, stopping
+        // above the chin perimeter. Jaw angles and outer cheek are not anchors.
+        new[] {61,57,43,202,106,204,211,194},
+        new[] {291,287,273,422,335,424,431,418}
     };
     public readonly Vector4[] Centers = new Vector4[Count]; // xy center, zw core half-size
     public readonly Vector4[] Axes = new Vector4[Count]; // xy local X, z feather (pixels)
@@ -73,13 +83,27 @@ public sealed class FacelessRegions
         Fit(4, p, p[291] - p[61], scale, featherFraction);
         Fit(5, p, p[291] - p[61], scale, featherFraction);
         Fit(6, p, right, scale, featherFraction);
+        FitFold(7, p, p[57] - p[203], scale, featherFraction);
+        FitFold(8, p, p[287] - p[423], scale, featherFraction);
+        FitFold(9, p, p[211] - p[61], scale, featherFraction);
+        FitFold(10, p, p[431] - p[291], scale, featherFraction);
 
         // Symmetric cheek patches. Avoid nose folds, lips and the forehead/hair.
         for (int i = 0; i < 6; i++)
             Donors[i] = new Vector4(p[DonorIndices[i]].x, p[DonorIndices[i]].y, Width * 0.016f, 0);
-        TopLimit = Mathf.Max(Vector2.Dot(p[105]-Origin, up),
-            Vector2.Dot(p[334]-Origin, up)) + Height * 0.035f;
+        // Keep a real-skin source band above the brow's soft edge; the old
+        // brow+3.5% limit removed those neighbors and left a flat upper seam.
+        TopLimit = Mathf.Min(Vector2.Dot(p[10] - Origin, up) - Height * 0.05f,
+            Mathf.Max(Vector2.Dot(p[105] - Origin, up),
+                Vector2.Dot(p[334] - Origin, up)) + Height * 0.12f);
         return true;
+    }
+
+    void FitFold(int index, Vector2[] p, Vector2 alongCrease, float scale, float feather)
+    {
+        // Use this crease's own projected long axis. The short axis controls
+        // feather width, so the far-side fold contracts on head turns too.
+        Fit(index, p, new Vector2(alongCrease.y, -alongCrease.x), scale, feather);
     }
 
     void Fit(int index, Vector2[] p, Vector2 horizontal, float scale, float feather)

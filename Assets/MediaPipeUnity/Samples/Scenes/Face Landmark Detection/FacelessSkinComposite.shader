@@ -36,7 +36,7 @@ Shader "Faceless/SkinComposite"
             sampler2D _MainTex, _SkinTex, _SurfaceTex;
             float4 _Color, _ClipRect, _FaceBounds;
             float _Amount, _Volume, _Grain, _ShowMask, _VideoVisibility;
-            float _Stages[7];
+            float _Stages[FACELESS_REGION_COUNT];
             struct appdata { float4 vertex:POSITION; float2 uv:TEXCOORD0; float4 color:COLOR; };
             struct v2f { float4 vertex:SV_POSITION; float2 uv:TEXCOORD0; float4 color:COLOR; float4 local:TEXCOORD1; };
             v2f vert(appdata v)
@@ -54,7 +54,7 @@ Shader "Faceless/SkinComposite"
                 if (_Amount > 0 && all(atlas >= 0) && all(atlas <= 1))
                 {
                     float uncovered = 1.0;
-                    [unroll] for (int n=0;n<7;n++) uncovered *= 1.0-RegionAlpha(p,n)*_Stages[n];
+                    [unroll] for (int n=0;n<FACELESS_REGION_COUNT;n++) uncovered *= 1.0-RegionAlpha(p,n)*_Stages[n];
                     // The face oval is an anatomical ring, not the visible
                     // silhouette on a turn. Use the actual projected triangle
                     // surface here; keep the oval inset ONLY for donor seeds.
@@ -69,7 +69,9 @@ Shader "Faceless/SkinComposite"
                         float3 skin = tex2D(_SkinTex,atlas).rgb;
                         float2 q = (atlas-0.5)*2.0;
                         // A very gentle broad highlight; no nose/eye structure.
-                        skin *= 1.0 + _Volume * exp(-3.0*dot(q,q));
+                        // Optional artistic volume fades out before the edge;
+                        // it must not introduce a brightness seam at the blend.
+                        skin *= 1.0 + _Volume * exp(-3.0*dot(q,q)) * smoothstep(0.45, 1.0, amount);
                         float grain = frac(sin(dot(floor(atlas*768.0),float2(12.9898,78.233)))*43758.5453)-0.5;
                         skin += grain * (_Grain / 255.0);
                         outputColor.rgb = lerp(original.rgb, saturate(skin), amount);
@@ -77,7 +79,7 @@ Shader "Faceless/SkinComposite"
                     if (_ShowMask > 0.5)
                     {
                         outputColor.rgb = lerp(outputColor.rgb,float3(0.1,0.8,0.65),amount*0.45);
-                        [unroll] for (int n=0;n<7;n++)
+                        [unroll] for (int n=0;n<FACELESS_REGION_COUNT;n++)
                         {
                             float d=RegionDistance(p,n);
                             float regionOutline=1.0-smoothstep(0.4,1.6,min(abs(d),abs(d-_RegionAxes[n].z)));

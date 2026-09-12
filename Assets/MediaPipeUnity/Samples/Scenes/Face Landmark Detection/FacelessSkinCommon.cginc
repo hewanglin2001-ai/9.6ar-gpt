@@ -1,8 +1,9 @@
 #ifndef FACELESS_SKIN_COMMON
 #define FACELESS_SKIN_COMMON
+#define FACELESS_REGION_COUNT 11
 float4 _CameraSize;
 float4 _FrameOrigin, _FrameU, _FrameV;
-float4 _Regions[7], _RegionAxes[7], _Boundary[36], _Donors[6];
+float4 _Regions[FACELESS_REGION_COUNT], _RegionAxes[FACELESS_REGION_COUNT], _Boundary[36], _Donors[6];
 float _ContourInset;
 
 float2 AtlasToPixel(float2 uv)
@@ -33,7 +34,7 @@ float RegionAlpha(float2 p, int n)
     return 1.0 - smoothstep(0.0, max(_RegionAxes[n].z, 0.5), RegionDistance(p, n));
 }
 // Signed distance to the face outline, used solely as an EXCLUSION guard.
-// Positive coverage is always the union of the seven local feature regions.
+// Positive coverage is always the union of local feature/fold regions.
 float BoundaryDistance(float2 p)
 {
     float d2 = 1e20;
@@ -55,6 +56,16 @@ float BoundaryDistance(float2 p)
 float BoundaryGuard(float2 p)
 {
     return smoothstep(_ContourInset, _ContourInset * 2.0, BoundaryDistance(p));
+}
+// Shared donor/seed eligibility. Exclude features BEFORE filtering so the
+// reconstruction cannot copy eyes, lips or the newly covered fold shadows.
+float TrustedSkinWeight(float2 p)
+{
+    float confidence = BoundaryGuard(p);
+    [unroll] for (int n = 0; n < FACELESS_REGION_COUNT; n++)
+        confidence *= smoothstep(0.0, max(_RegionAxes[n].z, 1.0) * 0.45, RegionDistance(p, n));
+    float heightOnFace = dot(p - _FrameOrigin.xy, normalize(_FrameV.xy));
+    return confidence * (1.0 - smoothstep(_FrameV.z, _FrameV.z + _FrameOrigin.w * 0.025, heightOnFace));
 }
 // Unique name: UnityCG.cginc already declares Luminance. On targets where
 // half/fixed map to float, overloading that name can become a redefinition.

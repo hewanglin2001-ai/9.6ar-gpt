@@ -1117,7 +1117,8 @@ MonoBehaviour:
   effectAmount: 1
   maskScale: 1
   featherFraction: 0.09
-  volume: 0.045
+  volume: 0
+  localColorStrength: 1
   fineGrain: 0.35
   reconstructionResolution: 256
   colorSmoothingSeconds: 0.065
