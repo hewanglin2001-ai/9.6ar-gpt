@@ -1,5 +1,6 @@
 using System;
 using Mediapipe.Unity;
+using Mediapipe.Unity.Sample.FaceLandmarkDetection;
 using UnityEngine;
 using UnityEngine.UI;
 
@@ -18,6 +19,7 @@ public class MidFaceEraseMask : MonoBehaviour
     public RawImage screenImage;
     public Shader reconstructionShader;
     public Shader compositeShader;
+    public Shader surfaceShader;
 
     [Header("Final skin / 最终皮肤")]
     [Range(0f, 1f)] public float effectAmount = 1f;
@@ -50,12 +52,14 @@ public class MidFaceEraseMask : MonoBehaviour
     public event Action<MidFaceEraseMask> FrameUpdated;
 
     readonly FacelessRegions _regions = new FacelessRegions();
+    readonly FacelessSurface _surface = new FacelessSurface();
     readonly Vector2[] _points = new Vector2[468];
     readonly Vector2[] _lastRaw = new Vector2[468];
     readonly Vector2[] _velocity = new Vector2[468];
     readonly Transform[] _landmarkTransforms = new Transform[468];
     readonly float[] _stages = new float[7];
     FaceLandmarkerResultAnnotationController _controller;
+    FaceLandmarkerRunner _runner;
     Renderer[] _annotationRenderers;
     bool[] _originalVisibility;
     Material _reconstruction, _composite, _originalMaterial;
@@ -65,6 +69,7 @@ public class MidFaceEraseMask : MonoBehaviour
     bool _historyReady, _pointsReady, _boundImage, _maskReady;
     float _nextFind, _lastLandmarkTime, _lastSeen = -100f;
     float _nextShaderCheck;
+    float _videoVisibility = 1f;
     Rect _controlRect;
 
     void OnEnable()
@@ -82,7 +87,8 @@ public class MidFaceEraseMask : MonoBehaviour
         PresentationSeconds = GrowthProgress = 0;
         if (reconstructionShader == null) reconstructionShader = Shader.Find("Hidden/Faceless/SkinReconstruction");
         if (compositeShader == null) compositeShader = Shader.Find("Faceless/SkinComposite");
-        if (!CheckShader(reconstructionShader) || !CheckShader(compositeShader))
+        if (surfaceShader == null) surfaceShader = Shader.Find("Hidden/Faceless/SurfaceGuard");
+        if (!CheckShader(reconstructionShader) || !CheckShader(compositeShader) || !CheckShader(surfaceShader))
         {
             enabled = false;
             return;
@@ -90,6 +96,8 @@ public class MidFaceEraseMask : MonoBehaviour
         _reconstruction = new Material(reconstructionShader) { hideFlags = HideFlags.HideAndDontSave };
         _composite = new Material(compositeShader) { hideFlags = HideFlags.HideAndDontSave };
         _composite.SetFloat("_Amount", 0);
+        _videoVisibility = 1f;
+        _composite.SetFloat("_VideoVisibility", _videoVisibility);
         _composite.SetVector("_FrameU", new Vector4(1, 0, 0, 0));
         _composite.SetVector("_FrameV", new Vector4(0, 1, 0, 0));
     }
@@ -122,6 +130,7 @@ public class MidFaceEraseMask : MonoBehaviour
     {
         if (Time.unscaledTime < _nextFind) return;
         _nextFind = Time.unscaledTime + 0.5f;
+        if (_runner == null) _runner = FindFirstObjectByType<FaceLandmarkerRunner>();
         if (screenImage == null)
         {
             foreach (var img in FindObjectsByType<RawImage>(FindObjectsInactive.Include, FindObjectsSortMode.None))
@@ -171,7 +180,7 @@ public class MidFaceEraseMask : MonoBehaviour
         if (Time.unscaledTime >= _nextShaderCheck)
         {
             _nextShaderCheck = Time.unscaledTime + 0.5f;
-            if (!CheckShader(reconstructionShader) || !CheckShader(compositeShader))
+            if (!CheckShader(reconstructionShader) || !CheckShader(compositeShader) || !CheckShader(surfaceShader))
             {
                 enabled = false; // OnDisable restores the original camera material.
                 return;
@@ -188,15 +197,27 @@ public class MidFaceEraseMask : MonoBehaviour
         }
         float now = Time.unscaledTime;
         float dt = Mathf.Min(Time.unscaledDeltaTime, 0.1f);
+        bool paired = _runner != null && _runner.PreviewIsSynchronized;
+        if (paired && _runner.LastMatchedFrameTime < 0f)
+        {
+            // Camera restart: never paint a previous visitor's cached skin
+            // over the new session's initial black capture buffer.
+            _pointsReady = _historyReady = _maskReady = false;
+            FacePresence = _videoVisibility = 0f;
+        }
         bool valid = _controller != null && _controller.HasFace
             && now - _controller.LastResultTime < 0.5f
+            && (!paired || _runner.PreviewHasFace)
             && pointListAnnotation != null && pointListAnnotation.gameObject.activeInHierarchy
             && _landmarkTransforms[0] != null;
         IsTracking = valid;
         if (valid)
         {
             bool reacquired = now - _lastSeen > 0.5f;
-            if (now - _lastSeen > resetAfterAbsence)
+            // A back/profile turn is indistinguishable from absence to a
+            // single face detector. Do not reveal features by automatically
+            // restarting the entry timeline on a paired-preview reacquisition.
+            if (!paired && now - _lastSeen > resetAfterAbsence)
             { PresentationSeconds = 0; GrowthProgress = 0; }
             if (reacquired) _pointsReady = _historyReady = false;
             _lastSeen = now;
@@ -204,28 +225,44 @@ public class MidFaceEraseMask : MonoBehaviour
             {
                 UpdateLandmarks();
                 _version = _controller.ResultVersion;
-                _maskReady = _regions.Build(_points, maskScale, featherFraction);
+                _maskReady = _regions.Build(_points, maskScale, featherFraction)
+                    && _surface.Render(_lastRaw, _cameraWidth, _cameraHeight, surfaceShader);
             }
-            else if (_pointsReady) _maskReady = _regions.Build(_points, maskScale, featherFraction);
-            FacePresence = Mathf.MoveTowards(FacePresence, 1f, dt / 0.18f);
+            else if (_pointsReady) _maskReady = _surface.Texture != null
+                && _regions.Build(_points, maskScale, featherFraction);
+            FacePresence = paired ? 1f : Mathf.MoveTowards(FacePresence, 1f, dt / 0.18f);
+            _videoVisibility = Mathf.MoveTowards(_videoVisibility, 1f, dt / 0.18f);
             PresentationSeconds += dt;
         }
         else
         {
-            FacePresence = Mathf.MoveTowards(FacePresence, 0f, dt / Mathf.Max(0.08f, lostFaceFadeSeconds));
+            if (paired && _historyReady)
+            {
+                // The runner holds the last paired frame. Keep its erasure
+                // intact; fade the entire held image to black on tracking loss
+                // instead of exposing the original features through the mask.
+                if (now - _lastSeen > 0.18f)
+                    _videoVisibility = Mathf.MoveTowards(_videoVisibility, 0f, dt / 0.25f);
+            }
+            else
+                FacePresence = Mathf.MoveTowards(FacePresence, 0f, dt / Mathf.Max(0.08f, lostFaceFadeSeconds));
             GrowthProgress = Mathf.MoveTowards(GrowthProgress, 0f, dt / 0.8f);
             if (FacePresence == 0f) _historyReady = false;
         }
-        if (!_maskReady) FacePresence = 0f;
+        if (!_maskReady)
+        {
+            FacePresence = 0f;
+            if (paired) _videoVisibility = 0f;
+        }
         UpdateStages();
         if (valid && _maskReady)
         {
             if (!EnsureTextures()) return;
             RenderSkin(source, dt);
         }
-        // Do not replace the working video material while waiting for the first
-        // tracked face / reconstructed skin frame.
-        if (!_boundImage && _historyReady)
+        // Paired preview starts black and stays protected while its first
+        // surface/skin frame is prepared. Unpaired preview keeps the old rule.
+        if (!_boundImage && (_historyReady || paired))
         {
             _originalMaterial = screenImage.material;
             screenImage.material = _composite;
@@ -277,6 +314,10 @@ public class MidFaceEraseMask : MonoBehaviour
             float cutoff = landmarkCutoff + 14f * _velocity[i].magnitude / Mathf.Max(_regions.Width, 40f);
             float alpha = 1f / (1f + 1f / (2f * Mathf.PI * cutoff * dt));
             _points[i] = Vector2.Lerp(_points[i], raw, alpha);
+            // Keep temporal smoothing subpixel in paired mode. A slow mask
+            // over a newer image reveals features even with accurate tracking.
+            if (_runner != null && _runner.PreviewIsSynchronized)
+                _points[i] = raw + Vector2.ClampMagnitude(_points[i] - raw, 0.35f);
             _lastRaw[i] = raw;
         }
         _pointsReady = true;
@@ -381,12 +422,14 @@ public class MidFaceEraseMask : MonoBehaviour
 
     void ApplyComposite(Material m)
     {
+        m.SetFloat("_VideoVisibility", _videoVisibility);
         m.SetFloat("_Amount", _maskReady && _history != null ? FacePresence*effectAmount : 0f);
         if (!_maskReady || _history == null) return;
         _regions.SetMaterial(m);
         m.SetVector("_CameraSize",new Vector4(_cameraWidth,_cameraHeight,1f/_cameraWidth,1f/_cameraHeight));
         m.SetFloatArray("_Stages",_stages);
         m.SetTexture("_SkinTex",_history[_historyIndex]);
+        m.SetTexture("_SurfaceTex",_surface.Texture);
         m.SetFloat("_Volume",volume); m.SetFloat("_Grain",fineGrain);
         m.SetFloat("_ShowMask",showMask ? 1f : 0f);
     }
@@ -427,6 +470,7 @@ public class MidFaceEraseMask : MonoBehaviour
     void DrawControls(int id)
     {
         GUILayout.Label(IsTracking ? "Tracking / "+Mathf.RoundToInt(FacePresence*100)+"%" : "Waiting for face");
+        if (_runner != null && _runner.PreviewIsSynchronized) GUILayout.Label("Paired camera + landmarks");
         GUILayout.Label("Erase / "+effectAmount.ToString("0.00"));
         effectAmount=GUILayout.HorizontalSlider(effectAmount,0,1);
         showLandmarks=GUILayout.Toggle(showLandmarks,"468 landmarks");
@@ -458,6 +502,7 @@ public class MidFaceEraseMask : MonoBehaviour
         if (_boundImage && screenImage!=null && screenImage.material==_composite) screenImage.material=_originalMaterial;
         _boundImage=false;
         RestoreVisuals(); ReleaseTextures();
+        _surface.Dispose();
         if (_reconstruction!=null) Destroy(_reconstruction);
         if (_composite!=null) Destroy(_composite);
         _reconstruction=_composite=null;

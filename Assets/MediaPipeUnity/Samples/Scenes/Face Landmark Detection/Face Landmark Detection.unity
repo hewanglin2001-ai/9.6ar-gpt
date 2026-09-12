@@ -137,7 +137,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!135 &210298569
 SphereCollider:
   m_ObjectHideFlags: 0
@@ -614,6 +614,7 @@ MonoBehaviour:
   screen: {fileID: 1006057043}
   runningMode: 0
   _faceLandmarkerResultAnnotationController: {fileID: 1006057044}
+  synchronizePreviewWithDetection: 1
 --- !u!224 &1229135957 stripped
 RectTransform:
   m_CorrespondingSourceObject: {fileID: 3259285889726014650, guid: 5713b959e3c77a58fb258133fc8e4aef,
@@ -1112,6 +1113,7 @@ MonoBehaviour:
   screenImage: {fileID: 0}
   reconstructionShader: {fileID: 4800000, guid: dbde178d52854b90bb39370de43e0126, type: 3}
   compositeShader: {fileID: 4800000, guid: 44e0f95dc2944fa3b6dbc92cfe06b3b2, type: 3}
+  surfaceShader: {fileID: 4800000, guid: 4b5a8ea2d25e4c628128035b0f868322, type: 3}
   effectAmount: 1
   maskScale: 1
   featherFraction: 0.09

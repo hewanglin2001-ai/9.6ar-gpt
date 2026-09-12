@@ -37,15 +37,26 @@ public sealed class FacelessRegions
 
     public bool Build(Vector2[] p, float scale, float featherFraction)
     {
-        Width = Vector2.Distance(p[234], p[454]);
         Height = Vector2.Distance(p[10], p[152]);
-        if (Width < 16 || Height < 24) return false;
+        if (Height < 24) return false;
         Vector2 up = (p[10] - p[152]).normalized;
         Vector2 right = new Vector2(up.y, -up.x);
         if (Vector2.Dot(right, p[454] - p[234]) < 0) right = -right;
-        Origin = (p[10] + p[152]) * 0.5f;
+        // At profile the two anatomical cheeks can project onto each other.
+        // Fit the reconstruction atlas to ALL projected vertices, including
+        // the nose/lips. This resizes only a texture workspace, never a mask.
+        Vector2 frameMin = new Vector2(float.MaxValue, float.MaxValue);
+        Vector2 frameMax = new Vector2(float.MinValue, float.MinValue);
+        for (int i = 0; i < 468; i++)
+        {
+            Vector2 q = new Vector2(Vector2.Dot(p[i], right), Vector2.Dot(p[i], up));
+            frameMin = Vector2.Min(frameMin, q); frameMax = Vector2.Max(frameMax, q);
+        }
+        Width = Mathf.Max(frameMax.x - frameMin.x, Height * 0.18f);
+        Vector2 frameCenter = (frameMin + frameMax) * 0.5f;
+        Origin = right * frameCenter.x + up * frameCenter.y;
         AxisU = right * (Width * 1.25f);
-        AxisV = up * (Height * 1.16f);
+        AxisV = up * (Mathf.Max(Height, frameMax.y - frameMin.y) * 1.16f);
         for (int i = 0; i < 36; i++)
         {
             Vector2 b = p[BoundaryIndices[i]];

@@ -4,6 +4,8 @@ Shader "Faceless/SkinComposite"
     {
         [PerRendererData] _MainTex ("Camera", 2D) = "white" {}
         _SkinTex ("Reconstructed skin", 2D) = "black" {}
+        _SurfaceTex ("Projected face surface", 2D) = "black" {}
+        _VideoVisibility ("Video visibility", Float) = 1
         _Color ("Tint", Color) = (1,1,1,1)
         _StencilComp ("Stencil comparison", Float) = 8
         _Stencil ("Stencil ID", Float) = 0
@@ -31,9 +33,9 @@ Shader "Faceless/SkinComposite"
             #include "UnityCG.cginc"
             #include "UnityUI.cginc"
             #include "FacelessSkinCommon.cginc"
-            sampler2D _MainTex, _SkinTex;
+            sampler2D _MainTex, _SkinTex, _SurfaceTex;
             float4 _Color, _ClipRect, _FaceBounds;
-            float _Amount, _Volume, _Grain, _ShowMask;
+            float _Amount, _Volume, _Grain, _ShowMask, _VideoVisibility;
             float _Stages[7];
             struct appdata { float4 vertex:POSITION; float2 uv:TEXCOORD0; float4 color:COLOR; };
             struct v2f { float4 vertex:SV_POSITION; float2 uv:TEXCOORD0; float4 color:COLOR; float4 local:TEXCOORD1; };
@@ -53,7 +55,15 @@ Shader "Faceless/SkinComposite"
                 {
                     float uncovered = 1.0;
                     [unroll] for (int n=0;n<7;n++) uncovered *= 1.0-RegionAlpha(p,n)*_Stages[n];
-                    amount = (1.0-uncovered) * BoundaryGuard(p) * _Amount;
+                    // The face oval is an anatomical ring, not the visible
+                    // silhouette on a turn. Use the actual projected triangle
+                    // surface here; keep the oval inset ONLY for donor seeds.
+                    float2 edgeTap = _CameraSize.zw * 0.35;
+                    float surfaceCoverage = (tex2D(_SurfaceTex, i.uv + edgeTap).r
+                        + tex2D(_SurfaceTex, i.uv - edgeTap).r
+                        + tex2D(_SurfaceTex, i.uv + float2(edgeTap.x, -edgeTap.y)).r
+                        + tex2D(_SurfaceTex, i.uv + float2(-edgeTap.x, edgeTap.y)).r) * 0.25;
+                    amount = (1.0-uncovered) * surfaceCoverage * _Amount;
                     if (amount > 0.00001)
                     {
                         float3 skin = tex2D(_SkinTex,atlas).rgb;
@@ -74,7 +84,7 @@ Shader "Faceless/SkinComposite"
                             float dotCenter=1.0-smoothstep(1.2,2.5,length(p-_Regions[n].xy));
                             outputColor.rgb=lerp(outputColor.rgb,float3(1,0.8,0.15),max(regionOutline,dotCenter));
                         }
-                        float bound=1.0-smoothstep(0.4,1.6,abs(BoundaryDistance(p)));
+                        float bound=4.0*surfaceCoverage*(1.0-surfaceCoverage);
                         outputColor.rgb=lerp(outputColor.rgb,float3(0.1,0.65,1),bound);
                         float2 box=abs(p-(_FaceBounds.xy+_FaceBounds.zw)*0.5)-(_FaceBounds.zw-_FaceBounds.xy)*0.5;
                         float boxDistance=length(max(box,0.0))+min(max(box.x,box.y),0.0);
@@ -82,6 +92,7 @@ Shader "Faceless/SkinComposite"
                         outputColor.rgb=lerp(outputColor.rgb,float3(0.2,0.5,1),boxLine);
                     }
                 }
+                outputColor.rgb *= _VideoVisibility;
                 outputColor *= i.color;
                 #ifdef UNITY_UI_CLIP_RECT
                 outputColor.a *= UnityGet2DClipping(i.local.xy,_ClipRect);
