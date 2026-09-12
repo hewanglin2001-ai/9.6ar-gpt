@@ -1,1805 +1,431 @@
+using System;
+using Mediapipe.Unity;
 using UnityEngine;
 using UnityEngine.UI;
-using System.Collections.Generic;
 
-[RequireComponent(typeof(MeshFilter))]
-[RequireComponent(typeof(MeshRenderer))]
+/// <summary>
+/// Camera-space skin reconstruction. Only trusted skin contributes to the fill;
+/// seven analytic feature masks composite it once over the original video.
+/// No face-shaped mesh, large-radius raw-video taps, CPU camera readback or
+/// per-frame Texture2D allocations.
+/// </summary>
+[DisallowMultipleComponent]
+[DefaultExecutionOrder(10000)] // after the MediaPipe annotation LateUpdate
 public class MidFaceEraseMask : MonoBehaviour
 {
-    // ============================================================
-    // AUTO REFERENCES
-    // 自动寻找，不需要手动拖
-    // ============================================================
-
-    [Header("Auto References")]
+    [Header("Automatic references / 自动关联")]
     public Transform pointListAnnotation;
     public RawImage screenImage;
+    public Shader reconstructionShader;
+    public Shader compositeShader;
 
-    // ============================================================
-    // LOCAL SMEAR MASK
-    // 局部涂抹设置
-    // ============================================================
+    [Header("Final skin / 最终皮肤")]
+    [Range(0f, 1f)] public float effectAmount = 1f;
+    [Range(0.95f, 1.15f)] public float maskScale = 1f;
+    [Range(0.025f, 0.10f)] public float featherFraction = 0.09f;
+    [Range(0f, 0.12f)] public float volume = 0.045f;
+    [Range(0f, 1f)] public float fineGrain = 0.35f;
+    [Tooltip("Only the smooth skin field is downsampled. Original video and mask edges stay at native resolution.")]
+    public int reconstructionResolution = 256;
+    [Range(0.01f, 0.18f)] public float colorSmoothingSeconds = 0.065f;
+    [Range(2f, 10f)] public float landmarkCutoff = 4f;
 
-    [Header("Local Smear Mask")]
+    [Header("Entry timeline / 入场渐变")]
+    [Tooltip("Off: judge the final look immediately. On: normal 0-3 s, eyes 3-6, nose 6-9, mouth 9-12, complete 12-15.")]
+    public bool playEntryAnimation = false;
+    public float resetAfterAbsence = 1.2f;
+    [Range(0.08f, 0.5f)] public float lostFaceFadeSeconds = 0.18f;
 
-    // 左右眼区域
-    public float eyeWidthScale = 1.70f;
-    public float eyeHeightScale = 2.10f;
+    [Header("Debug / 调试")]
+    public bool showLandmarks = false;
+    public bool showMask = false;
+    public bool showControls = true;
 
-    // 鼻子
-    public float noseWidthScale = 1.55f;
-    public float noseHeightScale = 1.18f;
+    public bool IsTracking { get; private set; }
+    public float FacePresence { get; private set; }
+    public float PresentationSeconds { get; private set; }
+    public float GrowthProgress { get; private set; }
+    public bool GrowthReady => IsTracking && playEntryAnimation && PresentationSeconds >= 15f;
+    public Matrix4x4 HeadPose => _controller != null ? _controller.FacePose : Matrix4x4.identity;
+    public event Action<MidFaceEraseMask> FrameUpdated;
 
-    // 嘴
-    public float mouthWidthScale = 1.32f;
-    public float mouthHeightScale = 3.20f;
+    readonly FacelessRegions _regions = new FacelessRegions();
+    readonly Vector2[] _points = new Vector2[468];
+    readonly Vector2[] _lastRaw = new Vector2[468];
+    readonly Vector2[] _velocity = new Vector2[468];
+    readonly Transform[] _landmarkTransforms = new Transform[468];
+    readonly float[] _stages = new float[7];
+    FaceLandmarkerResultAnnotationController _controller;
+    Renderer[] _annotationRenderers;
+    bool[] _originalVisibility;
+    Material _reconstruction, _composite, _originalMaterial;
+    RenderTexture[] _known, _temp, _filled, _history;
+    RenderTexture _donorTexture;
+    int _historyIndex, _version = -1, _size, _cameraWidth, _cameraHeight;
+    bool _historyReady, _pointsReady, _boundImage, _maskReady;
+    float _nextFind, _lastLandmarkTime, _lastSeen = -100f;
+    Rect _controlRect;
 
-    // 中央鼻梁 / T区
-    public float bridgeWidthRelative = 0.24f;
-    public float bridgeHeightRelative = 0.34f;
-
-    // 鼻子到嘴的区域
-    public float midLowerWidthRelative = 0.29f;
-    public float midLowerHeightRelative = 0.25f;
-
-    // 下巴中央
-    public float chinWidthRelative = 0.29f;
-    public float chinHeightRelative = 0.15f;
-
-    // 每个局部区域外围的柔软羽化
-    public float feather = 0.26f;
-
-    // 椭圆精细程度
-    public int ellipseSegments = 40;
-
-    public float zOffset = -10f;
-
-    // ============================================================
-    // TRACKING
-    // ============================================================
-
-    [Header("Tracking")]
-
-    public float smoothSpeed = 28f;
-
-    // ============================================================
-    // FACELESS EFFECT
-    //
-    // 这里故意比之前整脸版本的 Blur Radius 小
-    // 因为现在是在真正的五官局部处理
-    // 可以减少之前出现的重复眼睛 / 马赛克
-    // ============================================================
-
-    [Header("Faceless Effect")]
-
-    [Range(0.02f, 0.15f)]
-    public float blurRelativeToFace = 0.070f;
-
-    [Range(0f, 1f)]
-    public float flatten = 0.92f;
-
-    [Range(0f, 1f)]
-    public float keepLighting = 0.88f;
-
-    // ============================================================
-    // SKIN COLOR
-    // ============================================================
-
-    [Header("Skin Color Sampling")]
-
-    public bool enableSkinSampling = true;
-
-    public float sampleInterval = 0.10f;
-
-    public int sampleRadius = 4;
-
-    public float skinColorSmooth = 0.22f;
-
-    // ============================================================
-    // MEDIAPIPE VISUALS
-    // ============================================================
-
-    [Header("MediaPipe Visuals")]
-
-    public bool hideLandmarkVisuals = true;
-
-    public float hideVisualInterval = 0.25f;
-
-    // ============================================================
-    // DEBUG
-    // ============================================================
-
-    [Header("Debug")]
-
-    public Color sampledSkinColor =
-        new Color(
-            0.72f,
-            0.55f,
-            0.43f,
-            1f
-        );
-
-    // ============================================================
-    // INTERNAL
-    // ============================================================
-
-    private Mesh mesh;
-    private MeshRenderer meshRenderer;
-    private Material runtimeMaterial;
-
-    private Vector3[] smoothedVertices;
-
-    private float nextSampleTime = 0f;
-    private float nextHideTime = 0f;
-
-    // ============================================================
-    // SKIN SAMPLE POINTS
-    //
-    // 全部从真正脸颊取样，
-    // 不从眼睛、嘴、头发区域取颜色。
-    // ============================================================
-
-    private readonly int[] skinSampleIndices =
+    void OnEnable()
     {
-        50,
-        101,
-        205,
-
-        280,
-        330,
-        425
-    };
-
-    // ============================================================
-    // AWAKE
-    // ============================================================
-
-    void Awake()
-    {
-        mesh =
-            new Mesh();
-
-        mesh.name =
-            "Landmark Local Smear Mask";
-
-        MeshFilter filter =
-            GetComponent<MeshFilter>();
-
-        filter.mesh =
-            mesh;
-
-        meshRenderer =
-            GetComponent<MeshRenderer>();
-
-        Shader shader =
-            Shader.Find(
-                "Custom/FacelessBlur"
-            );
-
-        if (shader == null)
+        // A previous scene revision serialized these components. They must not
+        // render a second copy of the effect after upgrading this script.
+        var legacyRenderer = GetComponent<MeshRenderer>();
+        if (legacyRenderer != null) legacyRenderer.enabled = false;
+        _nextFind = 0;
+        _version = -1;
+        Array.Clear(_landmarkTransforms, 0, _landmarkTransforms.Length);
+        _pointsReady = _historyReady = _maskReady = false;
+        FacePresence = 0;
+        PresentationSeconds = GrowthProgress = 0;
+        if (reconstructionShader == null) reconstructionShader = Shader.Find("Hidden/Faceless/SkinReconstruction");
+        if (compositeShader == null) compositeShader = Shader.Find("Faceless/SkinComposite");
+        if (reconstructionShader == null || compositeShader == null ||
+            !reconstructionShader.isSupported || !compositeShader.isSupported)
         {
-            Debug.LogError(
-                "MidFaceEraseMask: 找不到 Custom/FacelessBlur Shader"
-            );
-
+            Debug.LogError("Faceless: skin shaders missing or unsupported. Pull all changed files, then reopen the scene.", this);
+            enabled = false;
             return;
         }
-
-        runtimeMaterial =
-            new Material(shader);
-
-        meshRenderer.material =
-            runtimeMaterial;
+        _reconstruction = new Material(reconstructionShader) { hideFlags = HideFlags.HideAndDontSave };
+        _composite = new Material(compositeShader) { hideFlags = HideFlags.HideAndDontSave };
+        _composite.SetFloat("_Amount", 0);
+        _composite.SetVector("_FrameU", new Vector4(1, 0, 0, 0));
+        _composite.SetVector("_FrameV", new Vector4(0, 1, 0, 0));
     }
 
-    // ============================================================
-    // UPDATE
-    // ============================================================
-
-    void Update()
+    void FindReferences()
     {
-        AutoFindReferences();
-
-        if (
-            pointListAnnotation == null ||
-            screenImage == null
-        )
-            return;
-
-        if (
-            pointListAnnotation.childCount < 468
-        )
-            return;
-
-        AttachToLandmarks();
-
-        BuildLocalSmearMask();
-
-        UpdateShader();
-
-        if (
-            hideLandmarkVisuals &&
-            Time.time >= nextHideTime
-        )
+        if (Time.unscaledTime < _nextFind) return;
+        _nextFind = Time.unscaledTime + 0.5f;
+        if (screenImage == null)
         {
-            HideMediaPipeVisuals();
-
-            nextHideTime =
-                Time.time +
-                hideVisualInterval;
+            foreach (var img in FindObjectsByType<RawImage>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+            {
+                if (img.GetComponent<Mediapipe.Unity.Screen>() != null ||
+                    img.GetComponentInParent<Mediapipe.Unity.Screen>() != null)
+                { screenImage = img; break; }
+            }
         }
-
-        if (
-            enableSkinSampling &&
-            Time.time >= nextSampleTime
-        )
-        {
-            SampleSkinColor();
-
-            nextSampleTime =
-                Time.time +
-                sampleInterval;
-        }
-    }
-
-    // ============================================================
-    // AUTO FIND REFERENCES
-    // ============================================================
-
-    void AutoFindReferences()
-    {
-        // --------------------------------------------------------
-        // 找 FaceLandmarkList Annotation
-        // 下面真正的 Point List Annotation
-        // --------------------------------------------------------
-
         if (pointListAnnotation == null)
         {
-            GameObject[] objects =
-                FindObjectsByType<GameObject>(
-                    FindObjectsInactive.Include,
-                    FindObjectsSortMode.None
-                );
-
-            foreach (GameObject obj in objects)
+            foreach (var face in FindObjectsByType<FaceLandmarkListAnnotation>(FindObjectsInactive.Include, FindObjectsSortMode.None))
             {
-                if (
-                    obj.name !=
-                    "Point List Annotation"
-                )
-                    continue;
-
-                Transform t =
-                    obj.transform;
-
-                if (t.parent == null)
-                    continue;
-
-                if (
-                    t.parent.name !=
-                    "FaceLandmarkList Annotation"
-                )
-                    continue;
-
-                if (
-                    t.childCount < 468
-                )
-                    continue;
-
-                pointListAnnotation =
-                    t;
-
-                Debug.Log(
-                    "MidFaceEraseMask: Found Face Point List Annotation."
-                );
-
+                var points = face.GetComponentInChildren<PointListAnnotation>(true);
+                if (points == null || points.transform.childCount < 468) continue;
+                pointListAnnotation = points.transform;
+                _controller = face.GetComponentInParent<FaceLandmarkerResultAnnotationController>();
+                for (int i = 0; i < 468; i++) _landmarkTransforms[i] = pointListAnnotation.GetChild(i);
+                CacheVisuals();
                 break;
             }
         }
-
-        // --------------------------------------------------------
-        // 找摄像头画面 RawImage
-        // --------------------------------------------------------
-
-        if (screenImage == null)
+        else if (_landmarkTransforms[0] == null && pointListAnnotation.childCount >= 468)
         {
-            RawImage[] images =
-                FindObjectsByType<RawImage>(
-                    FindObjectsInactive.Include,
-                    FindObjectsSortMode.None
-                );
-
-            foreach (RawImage img in images)
-            {
-                Transform current =
-                    img.transform;
-
-                while (current != null)
-                {
-                    if (
-                        current.name.Contains(
-                            "Annotatable Screen"
-                        )
-                    )
-                    {
-                        screenImage =
-                            img;
-
-                        Debug.Log(
-                            "MidFaceEraseMask: Found Annotatable Screen."
-                        );
-
-                        return;
-                    }
-
-                    current =
-                        current.parent;
-                }
-            }
+            _controller = pointListAnnotation.GetComponentInParent<FaceLandmarkerResultAnnotationController>();
+            for (int i = 0; i < 468; i++) _landmarkTransforms[i] = pointListAnnotation.GetChild(i);
+            CacheVisuals();
         }
+        if (_controller == null)
+            _controller = FindFirstObjectByType<FaceLandmarkerResultAnnotationController>();
     }
 
-    // ============================================================
-    // ATTACH
-    // ============================================================
-
-    void AttachToLandmarks()
+    void CacheVisuals()
     {
-        if (
-            transform.parent ==
-            pointListAnnotation
-        )
-            return;
-
-        transform.SetParent(
-            pointListAnnotation,
-            false
-        );
-
-        transform.localPosition =
-            Vector3.zero;
-
-        transform.localRotation =
-            Quaternion.identity;
-
-        transform.localScale =
-            Vector3.one;
+        RestoreVisuals();
+        Transform root = pointListAnnotation.parent;
+        if (root.parent != null && root.parent.name.Contains("FaceLandmarkListWithIris")) root = root.parent;
+        _annotationRenderers = root.GetComponentsInChildren<Renderer>(true);
+        _originalVisibility = new bool[_annotationRenderers.Length];
+        for (int i = 0; i < _annotationRenderers.Length; i++)
+            _originalVisibility[i] = _annotationRenderers[i].forceRenderingOff;
     }
 
-    // ============================================================
-    // LANDMARK
-    // ============================================================
-
-    Vector3 Landmark(int index)
+    void LateUpdate()
     {
-        Vector3 p =
-            pointListAnnotation
-            .GetChild(index)
-            .localPosition;
-
-        p.z =
-            zOffset;
-
-        return p;
-    }
-
-    // ============================================================
-    // AVERAGE LANDMARK
-    // ============================================================
-
-    Vector3 Average(params int[] indices)
-    {
-        Vector3 result =
-            Vector3.zero;
-
-        foreach (
-            int index
-            in indices
-        )
+        if (_reconstruction == null || _composite == null) return;
+        FindReferences();
+        if (screenImage == null || screenImage.texture == null) return;
+        Texture source = screenImage.texture;
+        if (source.width < 32 || source.height < 32) return;
+        if (!_boundImage)
         {
-            result +=
-                Landmark(index);
+            _originalMaterial = screenImage.material;
+            screenImage.material = _composite;
+            _boundImage = true;
         }
-
-        result /=
-            indices.Length;
-
-        result.z =
-            zOffset;
-
-        return result;
-    }
-
-    // ============================================================
-    // DISTANCE
-    // ============================================================
-
-    float Distance2D(
-        Vector3 a,
-        Vector3 b
-    )
-    {
-        return
-            Vector2.Distance(
-                new Vector2(
-                    a.x,
-                    a.y
-                ),
-                new Vector2(
-                    b.x,
-                    b.y
-                )
-            );
-    }
-
-    // ============================================================
-    // BUILD LOCAL MASK
-    // ============================================================
-
-    void BuildLocalSmearMask()
-    {
-        // --------------------------------------------------------
-        // 整张脸尺寸只用来决定相对大小，
-        // 不再作为遮罩轮廓。
-        // --------------------------------------------------------
-
-        Vector3 leftFace =
-            Landmark(234);
-
-        Vector3 rightFace =
-            Landmark(454);
-
-        Vector3 top =
-            Landmark(10);
-
-        Vector3 chin =
-            Landmark(152);
-
-        float faceWidth =
-            Distance2D(
-                leftFace,
-                rightFace
-            );
-
-        float faceHeight =
-            Distance2D(
-                top,
-                chin
-            );
-
-        if (
-            faceWidth < 0.001f ||
-            faceHeight < 0.001f
-        )
-            return;
-
-        // ========================================================
-        // 脸部坐标轴
-        //
-        // 这样歪头之后局部遮罩也会一起旋转。
-        // ========================================================
-
-        Vector2 horizontal =
-            new Vector2(
-                rightFace.x - leftFace.x,
-                rightFace.y - leftFace.y
-            ).normalized;
-
-        Vector2 vertical =
-            new Vector2(
-                chin.x - top.x,
-                chin.y - top.y
-            ).normalized;
-
-        // ========================================================
-        // 所有区域
-        // ========================================================
-
-        List<Region> regions =
-            new List<Region>();
-
-        // ========================================================
-        // 1. 左眼 + 左眉
-        // ========================================================
-
-        Vector3 leftEyeCenter =
-            Average(
-                33,
-                133,
-                159,
-                145
-            );
-
-        Vector3 leftBrowCenter =
-            Average(
-                70,
-                63,
-                105,
-                66
-            );
-
-        Vector3 leftEyeBrowCenter =
-            Vector3.Lerp(
-                leftEyeCenter,
-                leftBrowCenter,
-                0.38f
-            );
-
-        float leftEyeWidth =
-            Distance2D(
-                Landmark(33),
-                Landmark(133)
-            )
-            *
-            eyeWidthScale;
-
-        float leftEyeHeight =
-            Mathf.Max(
-                Distance2D(
-                    Landmark(159),
-                    Landmark(145)
-                )
-                *
-                eyeHeightScale,
-
-                faceHeight *
-                0.075f
-            );
-
-        regions.Add(
-            new Region(
-                leftEyeBrowCenter,
-                leftEyeWidth * 0.5f,
-                leftEyeHeight * 0.5f
-            )
-        );
-
-        // ========================================================
-        // 2. 右眼 + 右眉
-        // ========================================================
-
-        Vector3 rightEyeCenter =
-            Average(
-                362,
-                263,
-                386,
-                374
-            );
-
-        Vector3 rightBrowCenter =
-            Average(
-                300,
-                293,
-                334,
-                296
-            );
-
-        Vector3 rightEyeBrowCenter =
-            Vector3.Lerp(
-                rightEyeCenter,
-                rightBrowCenter,
-                0.38f
-            );
-
-        float rightEyeWidth =
-            Distance2D(
-                Landmark(362),
-                Landmark(263)
-            )
-            *
-            eyeWidthScale;
-
-        float rightEyeHeight =
-            Mathf.Max(
-                Distance2D(
-                    Landmark(386),
-                    Landmark(374)
-                )
-                *
-                eyeHeightScale,
-
-                faceHeight *
-                0.075f
-            );
-
-        regions.Add(
-            new Region(
-                rightEyeBrowCenter,
-                rightEyeWidth * 0.5f,
-                rightEyeHeight * 0.5f
-            )
-        );
-
-        // ========================================================
-        // 3. 鼻梁中央
-        //
-        // 直接由两眼中间到鼻子决定，
-        // 不使用脸边缘。
-        // ========================================================
-
-        Vector3 bridgeTop =
-            Average(
-                168,
-                6
-            );
-
-        Vector3 bridgeBottom =
-            Average(
-                1,
-                4
-            );
-
-        Vector3 bridgeCenter =
-            Vector3.Lerp(
-                bridgeTop,
-                bridgeBottom,
-                0.52f
-            );
-
-        regions.Add(
-            new Region(
-                bridgeCenter,
-
-                faceWidth *
-                bridgeWidthRelative *
-                0.5f,
-
-                faceHeight *
-                bridgeHeightRelative *
-                0.5f
-            )
-        );
-
-        // ========================================================
-        // 4. 鼻子
-        // ========================================================
-
-        Vector3 noseCenter =
-            Average(
-                1,
-                2,
-                4,
-                5
-            );
-
-        float noseWidth =
-            Distance2D(
-                Landmark(98),
-                Landmark(327)
-            )
-            *
-            noseWidthScale;
-
-        float noseHeight =
-            Distance2D(
-                Landmark(168),
-                Landmark(2)
-            )
-            *
-            noseHeightScale;
-
-        regions.Add(
-            new Region(
-                noseCenter,
-                noseWidth * 0.5f,
-                noseHeight * 0.5f
-            )
-        );
-
-        // ========================================================
-        // 5. 鼻子 → 嘴巴 / 法令纹中央区域
-        //
-        // 这是之前容易露出法令纹的位置。
-        // ========================================================
-
-        Vector3 upperLip =
-            Average(
-                0,
-                13
-            );
-
-        Vector3 midLowerCenter =
-            Vector3.Lerp(
-                Landmark(2),
-                upperLip,
-                0.58f
-            );
-
-        regions.Add(
-            new Region(
-                midLowerCenter,
-
-                faceWidth *
-                midLowerWidthRelative *
-                0.5f,
-
-                faceHeight *
-                midLowerHeightRelative *
-                0.5f
-            )
-        );
-
-        // ========================================================
-        // 6. 嘴巴
-        // ========================================================
-
-        Vector3 mouthCenter =
-            Average(
-                61,
-                291,
-                13,
-                14
-            );
-
-        float mouthWidth =
-            Distance2D(
-                Landmark(61),
-                Landmark(291)
-            )
-            *
-            mouthWidthScale;
-
-        float mouthHeight =
-            Mathf.Max(
-                Distance2D(
-                    Landmark(13),
-                    Landmark(14)
-                )
-                *
-                mouthHeightScale,
-
-                faceHeight *
-                0.070f
-            );
-
-        regions.Add(
-            new Region(
-                mouthCenter,
-                mouthWidth * 0.5f,
-                mouthHeight * 0.5f
-            )
-        );
-
-        // ========================================================
-        // 7. 下巴中央
-        //
-        // 只处理中央。
-        // 下颚角不会碰。
-        // ========================================================
-
-        Vector3 chinCenter =
-            Vector3.Lerp(
-                Average(
-                    17,
-                    18
-                ),
-                Landmark(152),
-                0.58f
-            );
-
-        regions.Add(
-            new Region(
-                chinCenter,
-
-                faceWidth *
-                chinWidthRelative *
-                0.5f,
-
-                faceHeight *
-                chinHeightRelative *
-                0.5f
-            )
-        );
-
-        // ========================================================
-        // 最终生成一个 Mesh
-        //
-        // 它实际上由多个互不相连的柔软椭圆组成。
-        // ========================================================
-
-        BuildMesh(
-            regions,
-            horizontal,
-            vertical
-        );
-    }
-
-    // ============================================================
-    // REGION
-    // ============================================================
-
-    private struct Region
-    {
-        public Vector3 center;
-        public float halfWidth;
-        public float halfHeight;
-
-        public Region(
-            Vector3 center,
-            float halfWidth,
-            float halfHeight
-        )
+        if (_cameraWidth != source.width || _cameraHeight != source.height)
         {
-            this.center =
-                center;
-
-            this.halfWidth =
-                halfWidth;
-
-            this.halfHeight =
-                halfHeight;
+            _cameraWidth = source.width; _cameraHeight = source.height;
+            _pointsReady = _historyReady = _maskReady = false;
         }
-    }
-
-    // ============================================================
-    // BUILD MESH
-    // ============================================================
-
-    void BuildMesh(
-        List<Region> regions,
-        Vector2 horizontal,
-        Vector2 vertical
-    )
-    {
-        ellipseSegments =
-            Mathf.Clamp(
-                ellipseSegments,
-                20,
-                64
-            );
-
-        int verticesPerRegion =
-            1 +
-            ellipseSegments +
-            ellipseSegments;
-
-        int totalVertexCount =
-            regions.Count *
-            verticesPerRegion;
-
-        List<Vector3> targetVertices =
-            new List<Vector3>(
-                totalVertexCount
-            );
-
-        List<Color> colors =
-            new List<Color>(
-                totalVertexCount
-            );
-
-        List<Vector2> uvs =
-            new List<Vector2>(
-                totalVertexCount
-            );
-
-        List<int> triangles =
-            new List<int>();
-
-        // --------------------------------------------------------
-        // 一个一个生成局部椭圆
-        // --------------------------------------------------------
-
-        foreach (
-            Region region
-            in regions
-        )
+        float now = Time.unscaledTime;
+        float dt = Mathf.Min(Time.unscaledDeltaTime, 0.1f);
+        bool valid = _controller != null && _controller.HasFace
+            && now - _controller.LastResultTime < 0.5f
+            && pointListAnnotation != null && pointListAnnotation.gameObject.activeInHierarchy
+            && _landmarkTransforms[0] != null;
+        IsTracking = valid;
+        if (valid)
         {
-            int baseIndex =
-                targetVertices.Count;
-
-            // ====================================================
-            // CENTER
-            // ====================================================
-
-            Vector3 center =
-                region.center;
-
-            center.z =
-                zOffset;
-
-            targetVertices.Add(
-                center
-            );
-
-            colors.Add(
-                Color.white
-            );
-
-            uvs.Add(
-                Vector2.zero
-            );
-
-            // ====================================================
-            // INNER RING
-            // 100% 特效
-            // ====================================================
-
-            for (
-                int i = 0;
-                i < ellipseSegments;
-                i++
-            )
+            bool reacquired = now - _lastSeen > 0.5f;
+            if (now - _lastSeen > resetAfterAbsence)
+            { PresentationSeconds = 0; GrowthProgress = 0; }
+            if (reacquired) _pointsReady = _historyReady = false;
+            _lastSeen = now;
+            if (_version != _controller.ResultVersion || !_pointsReady)
             {
-                float angle =
-                    (
-                        i /
-                        (float)ellipseSegments
-                    )
-                    *
-                    Mathf.PI *
-                    2f;
-
-                float cos =
-                    Mathf.Cos(angle);
-
-                float sin =
-                    Mathf.Sin(angle);
-
-                Vector3 p =
-                    center;
-
-                p.x +=
-                    horizontal.x *
-                    cos *
-                    region.halfWidth;
-
-                p.y +=
-                    horizontal.y *
-                    cos *
-                    region.halfWidth;
-
-                p.x +=
-                    vertical.x *
-                    sin *
-                    region.halfHeight;
-
-                p.y +=
-                    vertical.y *
-                    sin *
-                    region.halfHeight;
-
-                p.z =
-                    zOffset;
-
-                targetVertices.Add(
-                    p
-                );
-
-                colors.Add(
-                    new Color(
-                        1f,
-                        1f,
-                        1f,
-                        1f
-                    )
-                );
-
-                uvs.Add(
-                    Vector2.zero
-                );
+                UpdateLandmarks();
+                _version = _controller.ResultVersion;
+                _maskReady = _regions.Build(_points, maskScale, featherFraction);
             }
-
-            // ====================================================
-            // OUTER FEATHER RING
-            // ====================================================
-
-            for (
-                int i = 0;
-                i < ellipseSegments;
-                i++
-            )
-            {
-                float angle =
-                    (
-                        i /
-                        (float)ellipseSegments
-                    )
-                    *
-                    Mathf.PI *
-                    2f;
-
-                float cos =
-                    Mathf.Cos(angle);
-
-                float sin =
-                    Mathf.Sin(angle);
-
-                float outerWidth =
-                    region.halfWidth *
-                    (
-                        1f +
-                        feather
-                    );
-
-                float outerHeight =
-                    region.halfHeight *
-                    (
-                        1f +
-                        feather
-                    );
-
-                Vector3 p =
-                    center;
-
-                p.x +=
-                    horizontal.x *
-                    cos *
-                    outerWidth;
-
-                p.y +=
-                    horizontal.y *
-                    cos *
-                    outerWidth;
-
-                p.x +=
-                    vertical.x *
-                    sin *
-                    outerHeight;
-
-                p.y +=
-                    vertical.y *
-                    sin *
-                    outerHeight;
-
-                p.z =
-                    zOffset;
-
-                targetVertices.Add(
-                    p
-                );
-
-                colors.Add(
-                    new Color(
-                        1f,
-                        1f,
-                        1f,
-                        0f
-                    )
-                );
-
-                uvs.Add(
-                    Vector2.zero
-                );
-            }
-
-            // ====================================================
-            // CENTER -> INNER
-            // ====================================================
-
-            for (
-                int i = 0;
-                i < ellipseSegments;
-                i++
-            )
-            {
-                int next =
-                    (
-                        i + 1
-                    )
-                    %
-                    ellipseSegments;
-
-                triangles.Add(
-                    baseIndex
-                );
-
-                triangles.Add(
-                    baseIndex +
-                    1 +
-                    i
-                );
-
-                triangles.Add(
-                    baseIndex +
-                    1 +
-                    next
-                );
-            }
-
-            // ====================================================
-            // INNER -> OUTER FEATHER
-            // ====================================================
-
-            int innerStart =
-                baseIndex + 1;
-
-            int outerStart =
-                innerStart +
-                ellipseSegments;
-
-            for (
-                int i = 0;
-                i < ellipseSegments;
-                i++
-            )
-            {
-                int next =
-                    (
-                        i + 1
-                    )
-                    %
-                    ellipseSegments;
-
-                int innerA =
-                    innerStart + i;
-
-                int innerB =
-                    innerStart + next;
-
-                int outerA =
-                    outerStart + i;
-
-                int outerB =
-                    outerStart + next;
-
-                triangles.Add(
-                    innerA
-                );
-
-                triangles.Add(
-                    outerA
-                );
-
-                triangles.Add(
-                    outerB
-                );
-
-                triangles.Add(
-                    innerA
-                );
-
-                triangles.Add(
-                    outerB
-                );
-
-                triangles.Add(
-                    innerB
-                );
-            }
-        }
-
-        // ========================================================
-        // SMOOTH
-        // ========================================================
-
-        Vector3[] target =
-            targetVertices.ToArray();
-
-        if (
-            smoothedVertices == null ||
-            smoothedVertices.Length !=
-            target.Length
-        )
-        {
-            smoothedVertices =
-                new Vector3[
-                    target.Length
-                ];
-
-            for (
-                int i = 0;
-                i < target.Length;
-                i++
-            )
-            {
-                smoothedVertices[i] =
-                    target[i];
-            }
+            else if (_pointsReady) _maskReady = _regions.Build(_points, maskScale, featherFraction);
+            FacePresence = Mathf.MoveTowards(FacePresence, 1f, dt / 0.18f);
+            PresentationSeconds += dt;
         }
         else
         {
-            float t =
-                1f -
-                Mathf.Exp(
-                    -smoothSpeed *
-                    Time.deltaTime
-                );
-
-            for (
-                int i = 0;
-                i < target.Length;
-                i++
-            )
+            FacePresence = Mathf.MoveTowards(FacePresence, 0f, dt / Mathf.Max(0.08f, lostFaceFadeSeconds));
+            GrowthProgress = Mathf.MoveTowards(GrowthProgress, 0f, dt / 0.8f);
+            if (FacePresence == 0f) _historyReady = false;
+        }
+        if (!_maskReady) FacePresence = 0f;
+        UpdateStages();
+        if (valid && _maskReady)
+        {
+            if (!EnsureTextures()) return;
+            RenderSkin(source, dt);
+        }
+        ApplyComposite(_composite);
+        // UI masking may return a cached stencil-material instance.
+        Material drawing = screenImage.materialForRendering;
+        if (drawing != _composite && drawing != null) ApplyComposite(drawing);
+        if (_annotationRenderers != null)
+        {
+            for (int i = 0; i < _annotationRenderers.Length; i++)
             {
-                smoothedVertices[i] =
-                    Vector3.Lerp(
-                        smoothedVertices[i],
-                        target[i],
-                        t
-                    );
+                var r = _annotationRenderers[i];
+                if (r != null)
+                    r.forceRenderingOff = !showLandmarks || !r.transform.IsChildOf(pointListAnnotation);
             }
         }
+        FrameUpdated?.Invoke(this);
+    }
 
-        // ========================================================
-        // UV
-        // ========================================================
+    Vector2 LandmarkPixel(Transform t)
+    {
+        // Project through the SAME Canvas camera and RawImage rect/uvRect as
+        // the source. Handles mirrored feeds, fit/resize, and rotated display.
+        Canvas canvas = screenImage.canvas;
+        Camera camera = canvas != null && canvas.renderMode != RenderMode.ScreenSpaceOverlay ? canvas.worldCamera : null;
+        Vector2 screenPoint = RectTransformUtility.WorldToScreenPoint(camera, t.position);
+        RectTransformUtility.ScreenPointToLocalPointInRectangle(screenImage.rectTransform, screenPoint, camera, out Vector2 local);
+        Rect rect = screenImage.rectTransform.rect, uv = screenImage.uvRect;
+        return new Vector2((uv.x + (local.x - rect.xMin) / rect.width * uv.width) * _cameraWidth,
+            (uv.y + (local.y - rect.yMin) / rect.height * uv.height) * _cameraHeight);
+    }
 
-        Vector2[] uvArray =
-            new Vector2[
-                smoothedVertices.Length
-            ];
-
-        for (
-            int i = 0;
-            i < smoothedVertices.Length;
-            i++
-        )
+    void UpdateLandmarks()
+    {
+        float time = _controller.LastResultTime;
+        float dt = Mathf.Clamp(time - _lastLandmarkTime, 0.008f, 0.2f);
+        _lastLandmarkTime = time;
+        Vector2 nose = LandmarkPixel(_landmarkTransforms[1]);
+        if (_pointsReady && Vector2.Distance(nose, _points[1]) > Mathf.Max(_regions.Width * 0.4f, 30f))
+            _pointsReady = _historyReady = false;
+        for (int i = 0; i < 468; i++)
         {
-            uvArray[i] =
-                LocalToCameraUV(
-                    smoothedVertices[i]
-                );
+            Vector2 raw = LandmarkPixel(_landmarkTransforms[i]);
+            if (!_pointsReady) { _points[i] = _lastRaw[i] = raw; _velocity[i] = Vector2.zero; continue; }
+            Vector2 speed = (raw - _lastRaw[i]) / dt;
+            _velocity[i] = Vector2.Lerp(_velocity[i], speed, 1f - Mathf.Exp(-dt * 12f));
+            float cutoff = landmarkCutoff + 14f * _velocity[i].magnitude / Mathf.Max(_regions.Width, 40f);
+            float alpha = 1f / (1f + 1f / (2f * Mathf.PI * cutoff * dt));
+            _points[i] = Vector2.Lerp(_points[i], raw, alpha);
+            _lastRaw[i] = raw;
         }
-
-        // ========================================================
-        // APPLY
-        // ========================================================
-
-        mesh.Clear();
-
-        mesh.vertices =
-            smoothedVertices;
-
-        mesh.colors =
-            colors.ToArray();
-
-        mesh.uv =
-            uvArray;
-
-        mesh.triangles =
-            triangles.ToArray();
-
-        mesh.RecalculateBounds();
+        _pointsReady = true;
     }
 
-    // ============================================================
-    // UPDATE SHADER
-    // ============================================================
-
-    void UpdateShader()
+    void UpdateStages()
     {
-        if (
-            runtimeMaterial == null ||
-            screenImage == null ||
-            screenImage.texture == null
-        )
-            return;
-
-        runtimeMaterial.SetTexture(
-            "_MainTex",
-            screenImage.texture
-        );
-
-        runtimeMaterial.SetColor(
-            "_SkinColor",
-            sampledSkinColor
-        );
-
-        runtimeMaterial.SetFloat(
-            "_Flatten",
-            flatten
-        );
-
-        runtimeMaterial.SetFloat(
-            "_BrightnessStrength",
-            keepLighting
-        );
-
-        Vector2 topUV =
-            LocalToCameraUV(
-                Landmark(10)
-            );
-
-        Vector2 chinUV =
-            LocalToCameraUV(
-                Landmark(152)
-            );
-
-        float faceHeightUV =
-            Mathf.Abs(
-                topUV.y -
-                chinUV.y
-            );
-
-        float radius =
-            faceHeightUV *
-            blurRelativeToFace;
-
-        runtimeMaterial.SetFloat(
-            "_BlurRadius",
-            radius
-        );
+        if (!playEntryAnimation) { for (int i = 0; i < 7; i++) _stages[i] = 1f; GrowthProgress = 0; return; }
+        float t = PresentationSeconds;
+        _stages[0] = _stages[1] = Ramp(t, 3, 6);
+        _stages[2] = Ramp(t, 5, 8);
+        _stages[3] = Ramp(t, 6, 9);
+        _stages[4] = Ramp(t, 8, 11);
+        _stages[5] = Ramp(t, 9, 12);
+        _stages[6] = Ramp(t, 12, 15);
+        if (IsTracking) GrowthProgress = Ramp(t, 15, 24);
     }
+    static float Ramp(float t, float a, float b) => Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(a, b, t));
 
-    // ============================================================
-    // SKIN COLOR SAMPLING
-    // ============================================================
-
-    void SampleSkinColor()
+    bool EnsureTextures()
     {
-        if (
-            screenImage == null ||
-            screenImage.texture == null
-        )
-            return;
-
-        Color total =
-            Color.black;
-
-        int validCount =
-            0;
-
-        foreach (
-            int index
-            in skinSampleIndices
-        )
+        int size = Mathf.ClosestPowerOfTwo(Mathf.Clamp(reconstructionResolution, 128, 512));
+        if (_known != null && size == _size) return true;
+        ReleaseTextures();
+        RenderTextureFormat format = RenderTextureFormat.ARGBHalf;
+        if (!SystemInfo.SupportsRenderTextureFormat(format)) format = RenderTextureFormat.ARGBFloat;
+        if (!SystemInfo.SupportsRenderTextureFormat(format))
         {
-            Vector2 uv =
-                LocalToCameraUV(
-                    Landmark(index)
-                );
-
-            Color color;
-
-            if (
-                !TrySampleTexture(
-                    screenImage.texture,
-                    uv,
-                    out color
-                )
-            )
-                continue;
-
-            float brightness =
-                (
-                    color.r +
-                    color.g +
-                    color.b
-                )
-                /
-                3f;
-
-            if (
-                brightness < 0.12f ||
-                brightness > 0.95f
-            )
-                continue;
-
-            Color.RGBToHSV(
-                color,
-                out float h,
-                out float s,
-                out float v
-            );
-
-            if (
-                s > 0.78f
-            )
-                continue;
-
-            total +=
-                color;
-
-            validCount++;
+            Debug.LogError("Faceless: this GPU cannot render floating-point skin buffers.", this);
+            enabled = false; return false;
         }
-
-        if (
-            validCount == 0
-        )
-            return;
-
-        Color target =
-            total /
-            validCount;
-
-        target.a =
-            1f;
-
-        sampledSkinColor =
-            Color.Lerp(
-                sampledSkinColor,
-                target,
-                skinColorSmooth
-            );
+        _size = size;
+        int levels = 1;
+        for (int s = size; s > 4; s >>= 1) levels++;
+        _known = new RenderTexture[levels]; _temp = new RenderTexture[levels]; _filled = new RenderTexture[levels];
+        for (int i = 0, s = size; i < levels; i++, s >>= 1)
+        {
+            _known[i] = NewTexture(s,s,format,"Trusted skin");
+            _temp[i] = NewTexture(s,s,format,"Skin filter");
+            _filled[i] = NewTexture(s,s,format,"Skin reconstruction");
+        }
+        _history = new[] {NewTexture(size,size,format,"Skin history A"),NewTexture(size,size,format,"Skin history B")};
+        _donorTexture = NewTexture(6,1,format,"Cheek samples");
+        _historyReady = false;
+        return true;
+    }
+    static RenderTexture NewTexture(int w, int h, RenderTextureFormat format, string label)
+    {
+        var rt = new RenderTexture(w,h,0,format,RenderTextureReadWrite.Linear)
+        {
+            name=label, filterMode=FilterMode.Bilinear, wrapMode=TextureWrapMode.Clamp,
+            useMipMap=false, autoGenerateMips=false, antiAliasing=1, hideFlags=HideFlags.HideAndDontSave
+        };
+        rt.Create(); return rt;
     }
 
-    // ============================================================
-    // READ TEXTURE
-    // ============================================================
-
-    bool TrySampleTexture(
-        Texture texture,
-        Vector2 uv,
-        out Color result
-    )
+    void RenderSkin(Texture source, float dt)
     {
-        result =
-            sampledSkinColor;
-
-        uv.x =
-            Mathf.Clamp01(
-                uv.x
-            );
-
-        uv.y =
-            Mathf.Clamp01(
-                uv.y
-            );
-
-        // --------------------------------------------------------
-        // WebCamTexture
-        // --------------------------------------------------------
-
-        if (
-            texture is
-            WebCamTexture webcam
-        )
+        _regions.SetMaterial(_reconstruction);
+        _reconstruction.SetVector("_CameraSize", new Vector4(_cameraWidth,_cameraHeight,1f/_cameraWidth,1f/_cameraHeight));
+        RenderTexture previous = RenderTexture.active;
+        bool srgb = GL.sRGBWrite;
+        try
         {
-            if (
-                !webcam.isPlaying ||
-                webcam.width < 32 ||
-                webcam.height < 32
-            )
-                return false;
-
-            int cx =
-                Mathf.RoundToInt(
-                    uv.x *
-                    (
-                        webcam.width - 1
-                    )
-                );
-
-            int cy =
-                Mathf.RoundToInt(
-                    uv.y *
-                    (
-                        webcam.height - 1
-                    )
-                );
-
-            Color total =
-                Color.black;
-
-            int count =
-                0;
-
-            for (
-                int y = -sampleRadius;
-                y <= sampleRadius;
-                y++
-            )
+            GL.sRGBWrite = false; // RGBAHalf moments are numerical linear buffers.
+            Graphics.Blit(source,_donorTexture,_reconstruction,0);
+            _reconstruction.SetTexture("_DonorTex",_donorTexture);
+            Graphics.Blit(source,_known[0],_reconstruction,1);
+            for (int i=0;i<_known.Length-1;i++)
             {
-                for (
-                    int x = -sampleRadius;
-                    x <= sampleRadius;
-                    x++
-                )
+                _reconstruction.SetVector("_Direction",new Vector4(1,0,0,0));
+                Graphics.Blit(_known[i],_temp[i],_reconstruction,2);
+                _reconstruction.SetVector("_Direction",new Vector4(0,1,0,0));
+                Graphics.Blit(_temp[i],_known[i+1],_reconstruction,2);
+            }
+            int last=_known.Length-1;
+            Graphics.Blit(_known[last],_filled[last],_reconstruction,3);
+            for (int i=last-1;i>=0;i--)
+            {
+                _reconstruction.SetTexture("_KnownTex",_known[i]);
+                Graphics.Blit(_filled[i+1],_filled[i],_reconstruction,4);
+                for (int sweep=0;sweep<2;sweep++)
                 {
-                    int px =
-                        Mathf.Clamp(
-                            cx + x,
-                            0,
-                            webcam.width - 1
-                        );
-
-                    int py =
-                        Mathf.Clamp(
-                            cy + y,
-                            0,
-                            webcam.height - 1
-                        );
-
-                    total +=
-                        webcam.GetPixel(
-                            px,
-                            py
-                        );
-
-                    count++;
+                    _reconstruction.SetVector("_Direction",new Vector4(1,0,0,0));
+                    Graphics.Blit(_filled[i],_temp[i],_reconstruction,5);
+                    _reconstruction.SetVector("_Direction",new Vector4(0,1,0,0));
+                    Graphics.Blit(_temp[i],_filled[i],_reconstruction,5);
                 }
             }
-
-            if (
-                count == 0
-            )
-                return false;
-
-            result =
-                total /
-                count;
-
-            return true;
-        }
-
-        // --------------------------------------------------------
-        // Texture2D
-        // --------------------------------------------------------
-
-        if (
-            texture is
-            Texture2D tex &&
-            tex.isReadable
-        )
-        {
-            int cx =
-                Mathf.RoundToInt(
-                    uv.x *
-                    (
-                        tex.width - 1
-                    )
-                );
-
-            int cy =
-                Mathf.RoundToInt(
-                    uv.y *
-                    (
-                        tex.height - 1
-                    )
-                );
-
-            Color total =
-                Color.black;
-
-            int count =
-                0;
-
-            for (
-                int y = -sampleRadius;
-                y <= sampleRadius;
-                y++
-            )
+            int next=1-_historyIndex;
+            if (!_historyReady) Graphics.Blit(_filled[0],_history[next]);
+            else
             {
-                for (
-                    int x = -sampleRadius;
-                    x <= sampleRadius;
-                    x++
-                )
-                {
-                    int px =
-                        Mathf.Clamp(
-                            cx + x,
-                            0,
-                            tex.width - 1
-                        );
-
-                    int py =
-                        Mathf.Clamp(
-                            cy + y,
-                            0,
-                            tex.height - 1
-                        );
-
-                    total +=
-                        tex.GetPixel(
-                            px,
-                            py
-                        );
-
-                    count++;
-                }
+                _reconstruction.SetTexture("_HistoryTex",_history[_historyIndex]);
+                _reconstruction.SetFloat("_TemporalWeight",1f-Mathf.Exp(-dt/Mathf.Max(colorSmoothingSeconds,0.001f)));
+                Graphics.Blit(_filled[0],_history[next],_reconstruction,6);
             }
-
-            if (
-                count == 0
-            )
-                return false;
-
-            result =
-                total /
-                count;
-
-            return true;
+            _historyIndex=next; _historyReady=true;
         }
-
-        return false;
+        finally { RenderTexture.active=previous; GL.sRGBWrite=srgb; }
     }
 
-    // ============================================================
-    // LOCAL -> CAMERA UV
-    // ============================================================
-
-    Vector2 LocalToCameraUV(
-        Vector3 localPosition
-    )
+    void ApplyComposite(Material m)
     {
-        Vector3 world =
-            transform.TransformPoint(
-                localPosition
-            );
-
-        Canvas canvas =
-            screenImage.canvas;
-
-        Camera uiCamera =
-            null;
-
-        if (
-            canvas != null &&
-            canvas.renderMode !=
-            RenderMode.ScreenSpaceOverlay
-        )
-        {
-            uiCamera =
-                canvas.worldCamera;
-        }
-
-        Vector2 screenPoint =
-            RectTransformUtility
-            .WorldToScreenPoint(
-                uiCamera,
-                world
-            );
-
-        Vector2 localPoint;
-
-        bool ok =
-            RectTransformUtility
-            .ScreenPointToLocalPointInRectangle(
-                screenImage.rectTransform,
-                screenPoint,
-                uiCamera,
-                out localPoint
-            );
-
-        if (!ok)
-            return Vector2.zero;
-
-        Rect rect =
-            screenImage.rectTransform.rect;
-
-        float u =
-            Mathf.InverseLerp(
-                rect.xMin,
-                rect.xMax,
-                localPoint.x
-            );
-
-        float v =
-            Mathf.InverseLerp(
-                rect.yMin,
-                rect.yMax,
-                localPoint.y
-            );
-
-        Rect uvRect =
-            screenImage.uvRect;
-
-        u =
-            uvRect.x +
-            u *
-            uvRect.width;
-
-        v =
-            uvRect.y +
-            v *
-            uvRect.height;
-
-        return
-            new Vector2(
-                u,
-                v
-            );
+        m.SetFloat("_Amount", _maskReady && _history != null ? FacePresence*effectAmount : 0f);
+        if (!_maskReady || _history == null) return;
+        _regions.SetMaterial(m);
+        m.SetVector("_CameraSize",new Vector4(_cameraWidth,_cameraHeight,1f/_cameraWidth,1f/_cameraHeight));
+        m.SetFloatArray("_Stages",_stages);
+        m.SetTexture("_SkinTex",_history[_historyIndex]);
+        m.SetFloat("_Volume",volume); m.SetFloat("_Grain",fineGrain);
+        m.SetFloat("_ShowMask",showMask ? 1f : 0f);
     }
 
-    // ============================================================
-    // HIDE MEDIAPIPE LANDMARK VISUALS
-    // ============================================================
-
-    void HideMediaPipeVisuals()
+    /// <summary>Anchors for future plant prefabs. World position lies on the video
+    /// surface; rotation is the tracked head pose adjusted for preview mirroring.
+    /// Recommended ids: 168 (bridge), 6 (between eyes), 0 (above mouth).</summary>
+    public bool TryGetSurfaceAnchor(int landmarkId, out Pose pose, out float faceWidthWorld)
     {
-        if (
-            pointListAnnotation == null
-        )
-            return;
-
-        Transform root =
-            pointListAnnotation.parent;
-
-        if (root == null)
-            return;
-
-        if (
-            root.parent != null &&
-            root.parent.name.Contains(
-                "FaceLandmarkListWithIris"
-            )
-        )
-        {
-            root =
-                root.parent;
-        }
-
-        Renderer[] renderers =
-            root.GetComponentsInChildren<Renderer>(
-                true
-            );
-
-        foreach (
-            Renderer renderer
-            in renderers
-        )
-        {
-            if (
-                renderer == null
-            )
-                continue;
-
-            if (
-                renderer.gameObject ==
-                gameObject
-            )
-                continue;
-
-            if (
-                renderer.GetComponent<MidFaceEraseMask>()
-                != null
-            )
-                continue;
-
-            string path =
-                GetHierarchyPath(
-                    renderer.transform
-                );
-
-            bool isLandmark =
-                path.Contains(
-                    "Point Annotation"
-                )
-                ||
-                path.Contains(
-                    "Point List Annotation"
-                )
-                ||
-                path.Contains(
-                    "Connection"
-                )
-                ||
-                path.Contains(
-                    "IrisLandmark"
-                )
-                ||
-                path.Contains(
-                    "FaceLandmarkList Annotation"
-                );
-
-            if (
-                isLandmark
-            )
-            {
-                renderer.enabled =
-                    false;
-            }
-        }
+        pose=default; faceWidthWorld=0;
+        if (!IsTracking || !_pointsReady || screenImage == null || landmarkId<0 || landmarkId>=468) return false;
+        Rect rect=screenImage.rectTransform.rect, uv=screenImage.uvRect;
+        Vector2 p=_points[landmarkId];
+        Vector3 local=new Vector3(rect.xMin+(p.x/_cameraWidth-uv.x)/uv.width*rect.width,
+            rect.yMin+(p.y/_cameraHeight-uv.y)/uv.height*rect.height,0);
+        Matrix4x4 reflection=Matrix4x4.Scale(new Vector3(Mathf.Sign(uv.width),Mathf.Sign(uv.height),1));
+        Quaternion rotation=_controller.HasFacePose ? (reflection*HeadPose*reflection).rotation : Quaternion.identity;
+        pose=new Pose(screenImage.rectTransform.TransformPoint(local),screenImage.rectTransform.rotation*rotation);
+        faceWidthWorld=screenImage.rectTransform.TransformVector(Vector3.right*(_regions.Width/_cameraWidth*rect.width)).magnitude;
+        return true;
     }
 
-    // ============================================================
-    // PATH
-    // ============================================================
+    [ContextMenu("Replay entry / 重播入场")]
+    public void ReplayEntry() { playEntryAnimation=true; PresentationSeconds=GrowthProgress=0; }
+    [ContextMenu("Show final skin / 显示最终皮肤")]
+    public void ShowFinalSkin() { playEntryAnimation=false; effectAmount=1f; GrowthProgress=0; }
 
-    string GetHierarchyPath(
-        Transform t
-    )
+    void OnGUI()
     {
-        string path =
-            t.name;
+        if (Event.current.type==EventType.KeyDown && Event.current.keyCode==KeyCode.H)
+        { showControls=!showControls; Event.current.Use(); }
+        if (Event.current.type==EventType.KeyDown && Event.current.keyCode==KeyCode.R)
+        { ReplayEntry(); Event.current.Use(); }
+        if (!showControls) return;
+        _controlRect=new Rect(UnityEngine.Screen.width-244,12,232,244);
+        GUI.Window(GetInstanceID(),_controlRect,DrawControls,"Faceless / Skin");
+    }
+    void DrawControls(int id)
+    {
+        GUILayout.Label(IsTracking ? "Tracking / "+Mathf.RoundToInt(FacePresence*100)+"%" : "Waiting for face");
+        GUILayout.Label("Erase / "+effectAmount.ToString("0.00"));
+        effectAmount=GUILayout.HorizontalSlider(effectAmount,0,1);
+        showLandmarks=GUILayout.Toggle(showLandmarks,"468 landmarks");
+        showMask=GUILayout.Toggle(showMask,"Regions + boundary");
+        if (GUILayout.Button("Final skin")) ShowFinalSkin();
+        if (GUILayout.Button("Replay entry (R)")) ReplayEntry();
+        if (GUILayout.Button("Hide controls (H)")) showControls=false;
+    }
 
-        Transform current =
-            t.parent;
-
-        while (
-            current != null
-        )
-        {
-            path =
-                current.name +
-                "/" +
-                path;
-
-            current =
-                current.parent;
-        }
-
-        return path;
+    void RestoreVisuals()
+    {
+        if (_annotationRenderers==null) return;
+        for (int i=0;i<_annotationRenderers.Length;i++)
+            if (_annotationRenderers[i]!=null) _annotationRenderers[i].forceRenderingOff=_originalVisibility[i];
+        _annotationRenderers=null;
+    }
+    static void Release(RenderTexture rt) { if (rt!=null) {rt.Release(); Destroy(rt);} }
+    void ReleaseTextures()
+    {
+        if (_known!=null) foreach(var t in _known) Release(t);
+        if (_temp!=null) foreach(var t in _temp) Release(t);
+        if (_filled!=null) foreach(var t in _filled) Release(t);
+        if (_history!=null) foreach(var t in _history) Release(t);
+        Release(_donorTexture);
+        _known=_temp=_filled=_history=null; _donorTexture=null; _historyReady=false;
+    }
+    void OnDisable()
+    {
+        if (_boundImage && screenImage!=null && screenImage.material==_composite) screenImage.material=_originalMaterial;
+        _boundImage=false;
+        RestoreVisuals(); ReleaseTextures();
+        if (_reconstruction!=null) Destroy(_reconstruction);
+        if (_composite!=null) Destroy(_composite);
+        _reconstruction=_composite=null;
+        IsTracking=false; FacePresence=GrowthProgress=0;
     }
 }

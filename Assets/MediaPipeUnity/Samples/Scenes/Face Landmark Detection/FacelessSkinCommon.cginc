@@ -1,0 +1,60 @@
+#ifndef FACELESS_SKIN_COMMON
+#define FACELESS_SKIN_COMMON
+float4 _CameraSize;
+float4 _FrameOrigin, _FrameU, _FrameV;
+float4 _Regions[7], _RegionAxes[7], _Boundary[36], _Donors[6];
+float _ContourInset;
+
+float2 AtlasToPixel(float2 uv)
+{
+    return _FrameOrigin.xy + (uv.x - 0.5) * _FrameU.xy + (uv.y - 0.5) * _FrameV.xy;
+}
+float2 PixelToAtlas(float2 p)
+{
+    p -= _FrameOrigin.xy;
+    return float2(dot(p, _FrameU.xy) / dot(_FrameU.xy, _FrameU.xy),
+                  dot(p, _FrameV.xy) / dot(_FrameV.xy, _FrameV.xy)) + 0.5;
+}
+float RegionDistance(float2 p, int n)
+{
+    float2 delta = p - _Regions[n].xy;
+    float2 axis = _RegionAxes[n].xy;
+    float2 q = abs(float2(dot(delta, axis), dot(delta, float2(-axis.y, axis.x))));
+    float2 radius = max(_Regions[n].zw, float2(0.01, 0.01));
+    q /= radius;
+    float2 q2 = q * q;
+    float k = pow(dot(q2, q2), 0.25);
+    if (k < 0.0001) return -min(radius.x, radius.y);
+    float2 gradient = (q * q2) / (k * k * k * radius);
+    return (k - 1.0) / max(length(gradient), 0.0001);
+}
+float RegionAlpha(float2 p, int n)
+{
+    return 1.0 - smoothstep(0.0, max(_RegionAxes[n].z, 0.5), RegionDistance(p, n));
+}
+// Signed distance to the face outline, used solely as an EXCLUSION guard.
+// Positive coverage is always the union of the seven local feature regions.
+float BoundaryDistance(float2 p)
+{
+    float d2 = 1e20;
+    float inside = 0.0;
+    [loop] for (int i = 0; i < 36; i++)
+    {
+        float2 a = _Boundary[i].xy, b = _Boundary[(i + 1) % 36].xy;
+        float2 e = b - a, v = p - a;
+        float2 nearest = v - e * saturate(dot(v, e) / max(dot(e, e), 0.00001));
+        d2 = min(d2, dot(nearest, nearest));
+        if ((a.y > p.y) != (b.y > p.y))
+        {
+            float crossX = a.x + (p.y - a.y) * (b.x - a.x) / (b.y - a.y);
+            if (p.x < crossX) inside = 1.0 - inside;
+        }
+    }
+    return sqrt(d2) * (inside * 2.0 - 1.0);
+}
+float BoundaryGuard(float2 p)
+{
+    return smoothstep(_ContourInset, _ContourInset * 2.0, BoundaryDistance(p));
+}
+float Luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+#endif
