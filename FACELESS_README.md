@@ -1,5 +1,16 @@
 # 无脸皮肤重建：测试版本
 
+## 粉屏与读取失败修正
+
+- 自定义亮度函数已改名为 FacelessSkinLuma，避开
+  [UnityCG 内置 Luminance](https://docs.unity3d.com/6000.0/Documentation/Manual/SL-BuiltinFunctions.html)。
+  独立片元测试现在也注入这个内置函数名，防止重名问题再次漏检。
+- 编辑器会检查 Shader 编译错误，将具体消息输出到控制台；
+  检测到错误时恢复原始视频材质。首个人脸皮肤帧准备好之前不接管视频材质。
+- MediaPipe 异步读取失败时释放缓存帧并自动改用同步 CPU 读取，
+  避免错误累积后耗尽纹理帧池。同步读取可能降低帧率。
+- 本轮仍未在用户的 Mac/Metal 环境执行，不能仅凭截图断言粉屏原因已全部排除。
+
 ## 打开与测试
 
 1. Unity 停止播放；GitHub Desktop 选中 9.6ar-gpt，点击 Fetch origin，

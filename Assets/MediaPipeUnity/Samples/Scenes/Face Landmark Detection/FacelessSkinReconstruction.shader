@@ -56,7 +56,7 @@ Shader "Hidden/Faceless/SkinReconstruction"
             [unroll] for (int n = 0; n < 6; n++) cheek += tex2D(_DonorTex, float2((n+0.5)/6.0,0.5)).rgb / 6.0;
             // Luminance-relative rejection, no fixed skin-tone threshold.
             // Cheek color is a validity reference, never an opaque color overlay.
-            float ratio = Luminance(source) / max(Luminance(cheek), 0.005);
+            float ratio = FacelessSkinLuma(source) / max(FacelessSkinLuma(cheek), 0.005);
             confidence *= smoothstep(0.24, 0.52, ratio) * (1.0 - smoothstep(2.5, 4.0, ratio));
             return float4(source * confidence, confidence);
         }
@@ -86,7 +86,7 @@ Shader "Hidden/Faceless/SkinReconstruction"
         {
             float3 current = tex2D(_MainTex, i.uv).rgb;
             float3 previous = tex2D(_HistoryTex, i.uv).rgb;
-            float change = abs(Luminance(current) - Luminance(previous));
+            float change = abs(FacelessSkinLuma(current) - FacelessSkinLuma(previous));
             // Face-local history, reset on loss/reacquisition. Exposure changes
             // accelerate convergence rather than leaving a gray trail.
             float t = lerp(_TemporalWeight, 1.0, smoothstep(0.035, 0.16, change));

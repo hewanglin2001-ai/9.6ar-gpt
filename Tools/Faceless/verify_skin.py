@@ -106,7 +106,10 @@ def main():
         composite=name=='frag'
         body=shader_body(composite)
         setup='v2f i; i.uv=uv; i.color=vec4(1); i.local=vec4(0);' if composite else 'v2f_img i; i.uv=uv;'
-        frag='#version 330\n#define saturate(x) clamp(x,0.0,1.0)\nin vec2 uv; out vec4 result;\n'+body+'\nvoid main(){'+setup+'result='+name+'(i);}'
+        # Model the UnityCG symbol that the original standalone harness omitted.
+        # This deliberately fails if the project reintroduces a duplicate helper.
+        builtin='float Luminance(vec3 c){return dot(c,vec3(0.22,0.707,0.071));}\n'
+        frag='#version 330\n#define saturate(x) clamp(x,0.0,1.0)\nin vec2 uv; out vec4 result;\n'+builtin+body+'\nvoid main(){'+setup+'result='+name+'(i);}'
         (a.work/(name+'.glsl')).write_text(frag)
         prog=ctx.program(vertex_shader=VERT,fragment_shader=frag)
         programs[name]=(prog,ctx.simple_vertex_array(prog,buffer,'position'))

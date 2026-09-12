@@ -56,5 +56,7 @@ float BoundaryGuard(float2 p)
 {
     return smoothstep(_ContourInset, _ContourInset * 2.0, BoundaryDistance(p));
 }
-float Luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+// Unique name: UnityCG.cginc already declares Luminance. On targets where
+// half/fixed map to float, overloading that name can become a redefinition.
+float FacelessSkinLuma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 #endif

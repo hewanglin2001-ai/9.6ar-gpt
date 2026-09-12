@@ -64,6 +64,7 @@ public class MidFaceEraseMask : MonoBehaviour
     int _historyIndex, _version = -1, _size, _cameraWidth, _cameraHeight;
     bool _historyReady, _pointsReady, _boundImage, _maskReady;
     float _nextFind, _lastLandmarkTime, _lastSeen = -100f;
+    float _nextShaderCheck;
     Rect _controlRect;
 
     void OnEnable()
@@ -73,6 +74,7 @@ public class MidFaceEraseMask : MonoBehaviour
         var legacyRenderer = GetComponent<MeshRenderer>();
         if (legacyRenderer != null) legacyRenderer.enabled = false;
         _nextFind = 0;
+        _nextShaderCheck = 0;
         _version = -1;
         Array.Clear(_landmarkTransforms, 0, _landmarkTransforms.Length);
         _pointsReady = _historyReady = _maskReady = false;
@@ -80,10 +82,8 @@ public class MidFaceEraseMask : MonoBehaviour
         PresentationSeconds = GrowthProgress = 0;
         if (reconstructionShader == null) reconstructionShader = Shader.Find("Hidden/Faceless/SkinReconstruction");
         if (compositeShader == null) compositeShader = Shader.Find("Faceless/SkinComposite");
-        if (reconstructionShader == null || compositeShader == null ||
-            !reconstructionShader.isSupported || !compositeShader.isSupported)
+        if (!CheckShader(reconstructionShader) || !CheckShader(compositeShader))
         {
-            Debug.LogError("Faceless: skin shaders missing or unsupported. Pull all changed files, then reopen the scene.", this);
             enabled = false;
             return;
         }
@@ -92,6 +92,30 @@ public class MidFaceEraseMask : MonoBehaviour
         _composite.SetFloat("_Amount", 0);
         _composite.SetVector("_FrameU", new Vector4(1, 0, 0, 0));
         _composite.SetVector("_FrameV", new Vector4(0, 1, 0, 0));
+    }
+
+    bool CheckShader(Shader shader)
+    {
+        if (shader == null)
+        {
+            Debug.LogError("Faceless: missing skin shader reference. The original camera material is retained.", this);
+            return false;
+        }
+#if UNITY_EDITOR
+        // isSupported alone does not reliably expose failed editor variants.
+        if (UnityEditor.ShaderUtil.ShaderHasError(shader))
+        {
+            foreach (var message in UnityEditor.ShaderUtil.GetShaderMessages(shader))
+                Debug.LogError($"Faceless shader {shader.name}: {message.message} ({message.file}:{message.line})", this);
+            return false;
+        }
+#endif
+        if (!shader.isSupported)
+        {
+            Debug.LogError($"Faceless: {shader.name} is unsupported on {SystemInfo.graphicsDeviceType}.", this);
+            return false;
+        }
+        return true;
     }
 
     void FindReferences()
@@ -144,16 +168,19 @@ public class MidFaceEraseMask : MonoBehaviour
     void LateUpdate()
     {
         if (_reconstruction == null || _composite == null) return;
+        if (Time.unscaledTime >= _nextShaderCheck)
+        {
+            _nextShaderCheck = Time.unscaledTime + 0.5f;
+            if (!CheckShader(reconstructionShader) || !CheckShader(compositeShader))
+            {
+                enabled = false; // OnDisable restores the original camera material.
+                return;
+            }
+        }
         FindReferences();
         if (screenImage == null || screenImage.texture == null) return;
         Texture source = screenImage.texture;
         if (source.width < 32 || source.height < 32) return;
-        if (!_boundImage)
-        {
-            _originalMaterial = screenImage.material;
-            screenImage.material = _composite;
-            _boundImage = true;
-        }
         if (_cameraWidth != source.width || _cameraHeight != source.height)
         {
             _cameraWidth = source.width; _cameraHeight = source.height;
@@ -196,10 +223,18 @@ public class MidFaceEraseMask : MonoBehaviour
             if (!EnsureTextures()) return;
             RenderSkin(source, dt);
         }
+        // Do not replace the working video material while waiting for the first
+        // tracked face / reconstructed skin frame.
+        if (!_boundImage && _historyReady)
+        {
+            _originalMaterial = screenImage.material;
+            screenImage.material = _composite;
+            _boundImage = true;
+        }
         ApplyComposite(_composite);
         // UI masking may return a cached stencil-material instance.
         Material drawing = screenImage.materialForRendering;
-        if (drawing != _composite && drawing != null) ApplyComposite(drawing);
+        if (_boundImage && drawing != _composite && drawing != null) ApplyComposite(drawing);
         if (_annotationRenderers != null)
         {
             for (int i = 0; i < _annotationRenderers.Length; i++)

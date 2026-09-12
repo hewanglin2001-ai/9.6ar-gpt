@@ -116,7 +116,12 @@ namespace Mediapipe.Unity.Sample.FaceLandmarkDetection
 
             if (req.hasError)
             {
-              Debug.LogWarning($"Failed to read texture from the image source");
+              // The failed request still owns a pooled frame. Without releasing
+              // it, repeated failures exhaust all ten frames and stop tracking.
+              textureFrame.Release();
+              config.ImageReadMode = ImageReadMode.CPU;
+              Debug.LogWarning("FaceLandmarker: asynchronous camera readback failed. Switching to synchronous CPU readback.");
+              yield return null;
               continue;
             }
             image = textureFrame.BuildCPUImage();
